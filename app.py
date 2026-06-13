@@ -147,7 +147,7 @@ date format: YYYY-MM-DD. amount: total amount paid. ONLY JSON."""
         session = user_data.get(uid, {})
         session['pending_expense'] = {
             'merchant': info.get('merchant','—'),
-            'date': info.get('date') or datetime.now().strftime('%Y-%m-%d'),
+            'date': datetime.now().strftime('%Y-%m-%d'),  # always today
             'amount': float(info.get('amount') or 0),
             'currency': info.get('currency','CAD'),
             'description': info.get('description',''),
@@ -401,7 +401,7 @@ def handle_update(data):
                        f"💰 ${exp.get('amount',0):.2f} CAD\n"
                        f"📂 {exp.get('category','—')}\n"
                        f"📅 {exp.get('date','—')}\n\n"
-                       f"Total ce mois: ${sum(e['amount'] for e in expenses.get(uid,[]) if e.get('date','').startswith(datetime.now().strftime('%Y-%m'))):.2f} CAD",
+                       "Total ce mois (" + datetime.now().strftime('%B %Y') + f"): ${sum(e['amount'] for e in expenses.get(uid,[]) if e.get('date','').startswith(datetime.now().strftime('%Y-%m'))):.2f} CAD",
                        [[{'text':'📸 Nouveau reçu','callback_data':'nouveau'},
                          {'text':'📊 Rapport mensuel','callback_data':'report'}]])
 
