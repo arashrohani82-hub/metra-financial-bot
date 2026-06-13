@@ -406,8 +406,20 @@ def handle_update(data):
                          {'text':'📊 Rapport mensuel','callback_data':'report'}]])
 
             elif cdata == 'report':
+                # Show last 6 months to choose from
                 now = datetime.now()
-                do_report(chat_id, uid, now.month, now.year)
+                kb = []
+                for i in range(6):
+                    m = now.month - i
+                    y = now.year
+                    if m <= 0:
+                        m += 12
+                        y -= 1
+                    from calendar import month_abbr
+                    label = f"{month_abbr[m]} {y}"
+                    kb.append([{'text': f'📅 {label}', 'callback_data': f'report_{m}_{y}'}])
+                kb.append([{'text': '🔄 Nouveau reçu', 'callback_data': 'nouveau'}])
+                tg(chat_id, "📊 Choisissez le mois:", kb)
 
             elif cdata == 'nouveau':
                 session['pending_expense'] = {}
@@ -440,7 +452,17 @@ def handle_update(data):
                          {'text':'📸 Scanner un reçu','callback_data':'nouveau'}]])
                 elif text == '/rapport':
                     now = datetime.now()
-                    do_report(chat_id, uid, now.month, now.year)
+                    from calendar import month_abbr
+                    kb = []
+                    for i in range(6):
+                        m = now.month - i
+                        y = now.year
+                        if m <= 0:
+                            m += 12
+                            y -= 1
+                        label = f"{month_abbr[m]} {y}"
+                        kb.append([{'text': f'📅 {label}', 'callback_data': f'report_{m}_{y}'}])
+                    tg(chat_id, "📊 Choisissez le mois:", kb)
                 else:
                     tg(chat_id, "📸 Envoyez une photo du reçu.\n/rapport pour voir le rapport mensuel.")
 
