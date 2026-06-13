@@ -147,7 +147,7 @@ date format: YYYY-MM-DD. amount: total amount paid. ONLY JSON."""
         session = user_data.get(uid, {})
         session['pending_expense'] = {
             'merchant': info.get('merchant','—'),
-            'date': datetime.now().strftime('%Y-%m-%d'),  # always today
+            'date': info.get('date') or datetime.now().strftime('%Y-%m-%d'),
             'amount': float(info.get('amount') or 0),
             'currency': info.get('currency','CAD'),
             'description': info.get('description',''),
