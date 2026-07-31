@@ -29,3 +29,36 @@ def test_webhook_rejects_wrong_secret(tmp_path, monkeypatch):
         headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
     )
     assert response.status_code == 403
+
+
+def test_start_shows_persistent_menu(tmp_path, monkeypatch):
+    module = load_app(tmp_path, monkeypatch)
+    sent = []
+    monkeypatch.setattr(module, "telegram", lambda method, payload=None, **kwargs: sent.append((method, payload)))
+
+    module.handle_message(
+        {"from": {"id": 123}, "chat": {"id": 456}, "text": "/start"}
+    )
+
+    method, payload = sent[0]
+    assert method == "sendMessage"
+    assert payload["reply_markup"]["is_persistent"] is True
+    assert payload["reply_markup"]["keyboard"][0][0]["text"] == "🧾 رسید جدید"
+
+
+def test_setup_registers_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUBLIC_URL", "https://example.test")
+    monkeypatch.setenv("SETUP_SECRET", "setup-secret")
+    module = load_app(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_telegram(method, payload=None, **kwargs):
+        calls.append((method, payload))
+        return {"ok": True, "result": True}
+
+    monkeypatch.setattr(module, "telegram", fake_telegram)
+    response = module.app.test_client().get("/setup?key=setup-secret")
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    assert [method for method, _ in calls] == ["setWebhook", "setMyCommands"]

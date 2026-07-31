@@ -127,16 +127,40 @@ def telegram(method, payload=None, files=None, timeout=30):
     return response.json()
 
 
-def send_message(chat_id, text, keyboard=None):
+def send_message(chat_id, text, keyboard=None, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if keyboard:
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    elif keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     telegram("sendMessage", payload)
+
+
+def main_menu():
+    return {
+        "keyboard": [
+            [{"text": "🧾 رسید جدید"}, {"text": "📊 گزارش ماهانه"}],
+            [{"text": "❓ راهنما"}, {"text": "❌ لغو عملیات"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "عکس رسید را ارسال کنید…",
+    }
+
+
+def send_welcome(chat_id):
+    send_message(
+        chat_id,
+        "👋 <b>ایجنت حسابداری Métra Structure</b>\n\n"
+        "برای ثبت هزینه، عکس رسید یا فاکتور را بفرست.\n"
+        "همچنین می‌توانی از دکمه‌های پایین صفحه استفاده کنی.",
+        reply_markup=main_menu(),
+    )
 
 
 def answer_callback(callback_id):
@@ -538,19 +562,20 @@ def handle_message(message):
     text = message.get("text", "").strip()
     step, payload = get_session(user_id)
 
-    if text in {"/start", "/help"}:
+    if text in {"/start", "/help", "❓ راهنما"}:
+        send_welcome(chat_id)
+    elif text in {"/cancel", "❌ لغو عملیات"}:
+        set_session(user_id)
+        send_message(chat_id, "لغو شد.", reply_markup=main_menu())
+    elif text in {"/report", "📊 گزارش ماهانه"}:
+        send_message(chat_id, "ماه گزارش را انتخاب کن:", report_keyboard())
+    elif text in {"/new", "🧾 رسید جدید"}:
+        set_session(user_id)
         send_message(
             chat_id,
-            "👋 <b>ایجنت حسابداری Métra Structure</b>\n\n"
-            "عکس رسید یا فاکتور را بفرست.\n"
-            "/report — گزارش Excel\n"
-            "/cancel — لغو عملیات جاری",
+            "📷 عکس واضح رسید یا فاکتور را همین‌جا ارسال کن.",
+            reply_markup=main_menu(),
         )
-    elif text == "/cancel":
-        set_session(user_id)
-        send_message(chat_id, "لغو شد.")
-    elif text == "/report":
-        send_message(chat_id, "ماه گزارش را انتخاب کن:", report_keyboard())
     elif step == "enter_project" and text:
         payload["project_code"] = text.upper()[:50]
         save_expense(user_id, payload)
@@ -613,7 +638,26 @@ def setup():
     }
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
-    return jsonify(telegram("setWebhook", payload))
+    webhook_result = telegram("setWebhook", payload)
+    commands_result = telegram(
+        "setMyCommands",
+        {
+            "commands": [
+                {"command": "start", "description": "شروع و نمایش منوی اصلی"},
+                {"command": "new", "description": "ثبت رسید جدید"},
+                {"command": "report", "description": "دریافت گزارش ماهانه"},
+                {"command": "help", "description": "راهنمای استفاده"},
+                {"command": "cancel", "description": "لغو عملیات جاری"},
+            ]
+        },
+    )
+    return jsonify(
+        {
+            "ok": bool(webhook_result.get("ok") and commands_result.get("ok")),
+            "webhook": webhook_result,
+            "commands": commands_result,
+        }
+    )
 
 
 @app.get("/")
