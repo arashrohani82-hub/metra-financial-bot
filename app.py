@@ -1,517 +1,625 @@
-import os, io, json, logging, random, base64
-from datetime import datetime
-from flask import Flask, request, jsonify
-import requests as req
-from anthropic import Anthropic
+import base64
+import hashlib
+import html
+import io
+import json
+import logging
+import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-from reportlab.graphics.shapes import Drawing
-from reportlab.graphics.charts.piecharts import Pie
-from reportlab.graphics.charts.barcharts import VerticalBarChart
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.chart import BarChart, PieChart, Reference
-from openpyxl.chart.series import DataPoint
+from datetime import datetime
+from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import openpyxl
+import requests
+from anthropic import Anthropic
+from flask import Flask, jsonify, request
+from openpyxl.styles import Alignment, Font, PatternFill
+
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("metra_accounting")
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+SETUP_SECRET = os.getenv("SETUP_SECRET", "")
+ALLOWED_USERS = {
+    int(value.strip())
+    for value in os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+
+if not ALLOWED_USERS:
+    raise RuntimeError("ALLOWED_TELEGRAM_USER_IDS is required")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RECEIPT_DIR = DATA_DIR / "receipts"
+RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "accounting.db"
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
-client = Anthropic()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8632709979:AAGUxEXPk80YRVvrEnEQCpIKIYwLFC635ts")
-
-# ── Persistent storage ──────────────────────────────────────────────────────
-DATA_FILE = '/tmp/financial_data.json'
-user_data = {}   # session state per user
-expenses = {}    # all expenses per user: {uid: [expense, ...]}
-
-def load_data():
-    global user_data, expenses
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                saved = json.load(f)
-                user_data = saved.get('sessions', {})
-                expenses = saved.get('expenses', {})
-            logger.info(f"Loaded {sum(len(v) for v in expenses.values())} expenses")
-    except Exception as e:
-        logger.warning(f"load_data error: {e}")
-
-def save_data():
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump({'sessions': user_data, 'expenses': expenses}, f, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"save_data error: {e}")
-
-load_data()
-
-# ── Canadian accounting categories ─────────────────────────────────────────
 COMPANY_CATEGORIES = [
-    "🚗 Transport & Véhicule",
-    "🍽️ Repas & Représentation",
-    "🏢 Bureau & Loyer",
-    "💻 Technologie & Logiciels",
-    "📞 Télécom & Internet",
-    "🔧 Matériel & Équipement",
-    "📋 Services Professionnels",
-    "📢 Marketing & Publicité",
-    "✈️ Voyage & Déplacement",
-    "📚 Formation & Développement",
-    "🏥 Assurances",
-    "🏛️ Taxes & Licences",
-    "💼 Fournitures de Bureau",
-    "🔨 Sous-traitance",
-    "❓ Autre dépense",
+    "Transport et véhicule",
+    "Repas et représentation",
+    "Bureau et loyer",
+    "Technologie et logiciels",
+    "Télécom et internet",
+    "Matériel et équipement",
+    "Services professionnels",
+    "Marketing et publicité",
+    "Voyage et déplacement",
+    "Formation",
+    "Assurances",
+    "Taxes et licences",
+    "Fournitures de bureau",
+    "Sous-traitance",
+    "Autre dépense",
 ]
 
 PERSONAL_CATEGORIES = [
-    "🛒 Épicerie & Alimentation",
-    "🍔 Restaurants & Sorties",
-    "🚗 Transport & Essence",
-    "🏠 Logement & Services",
-    "👕 Vêtements & Mode",
-    "🏥 Santé & Médical",
-    "🎬 Loisirs & Divertissement",
-    "📱 Abonnements & Tech",
-    "✈️ Voyage & Vacances",
-    "🎁 Cadeaux & Dons",
-    "💰 Épargne & Investissement",
-    "❓ Autre dépense",
+    "Épicerie et alimentation",
+    "Restaurants et sorties",
+    "Transport et essence",
+    "Logement et services",
+    "Vêtements",
+    "Santé et médical",
+    "Loisirs",
+    "Abonnements et technologie",
+    "Voyage",
+    "Cadeaux et dons",
+    "Autre dépense",
 ]
 
-# ── Telegram helpers ────────────────────────────────────────────────────────
-def tg(chat_id, text, keyboard=None):
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
-    if keyboard:
-        payload['reply_markup'] = {'inline_keyboard': keyboard}
-    r = req.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage', json=payload, timeout=15)
-    logger.info(f"tg sent: {r.status_code} to {chat_id}")
-    return r
 
-def tg_doc(chat_id, buf, filename, caption):
+def db():
+    connection = sqlite3.connect(DB_PATH, timeout=20)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    return connection
+
+
+def init_db():
+    with db() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id INTEGER PRIMARY KEY,
+                step TEXT,
+                payload TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                merchant TEXT NOT NULL,
+                expense_date TEXT NOT NULL,
+                subtotal REAL NOT NULL DEFAULT 0,
+                gst REAL NOT NULL DEFAULT 0,
+                qst REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT 'CAD',
+                description TEXT,
+                expense_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                project_code TEXT,
+                receipt_hash TEXT NOT NULL,
+                receipt_path TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, receipt_hash)
+            );
+            """
+        )
+
+
+init_db()
+
+
+def telegram(method, payload=None, files=None, timeout=30):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    response = requests.post(url, json=payload, files=files, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def send_message(chat_id, text, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    telegram("sendMessage", payload)
+
+
+def answer_callback(callback_id):
     try:
-        buf.seek(0)
-        file_bytes = buf.read()
-        logger.info(f"tg_doc: sending {filename}, size={len(file_bytes)} bytes")
-        resp = req.post(
-            f'https://api.telegram.org/bot{BOT_TOKEN}/sendDocument',
-            data={'chat_id': chat_id, 'caption': caption},
-            files={'document': (filename, file_bytes)},
-            timeout=60)
-        logger.info(f"tg_doc response: {resp.status_code}")
-    except Exception as e:
-        import traceback
-        logger.error(f"tg_doc error: {e}\n{traceback.format_exc()}")
-        tg(chat_id, "❌ Erreur envoi fichier: " + str(e))
+        telegram("answerCallbackQuery", {"callback_query_id": callback_id})
+    except Exception:
+        logger.exception("Unable to answer callback")
+
+
+def set_session(user_id, step=None, payload=None):
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions(user_id, step, payload, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                step=excluded.step,
+                payload=excluded.payload,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                step,
+                json.dumps(payload or {}, ensure_ascii=False),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+
+
+def get_session(user_id):
+    with db() as connection:
+        row = connection.execute(
+            "SELECT step, payload FROM sessions WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not row:
+        return None, {}
+    return row["step"], json.loads(row["payload"])
+
+
+def is_allowed(user_id):
+    return user_id in ALLOWED_USERS
+
+
+def safe(value):
+    return html.escape(str(value or "—"))
+
 
 def category_keyboard(categories):
-    """Build inline keyboard from category list (2 per row)"""
-    kb = []
-    for i in range(0, len(categories), 2):
-        row = [{'text': categories[i], 'callback_data': f'cat_{i}'}]
-        if i+1 < len(categories):
-            row.append({'text': categories[i+1], 'callback_data': f'cat_{i+1}'})
-        kb.append(row)
-    return kb
-
-# ── Extract expense from photo ──────────────────────────────────────────────
-def do_extract_receipt(chat_id, uid, file_id):
-    uid = str(uid)
-    try:
-        r = req.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}', timeout=10)
-        fpath = r.json()['result']['file_path']
-        img_r = req.get(f'https://api.telegram.org/file/bot{BOT_TOKEN}/{fpath}', timeout=15)
-        img_b64 = base64.b64encode(img_r.content).decode()
-
-        prompt = """Extract expense info from this receipt/invoice. Return ONLY JSON:
-{"merchant":"","date":"","amount":0.0,"currency":"CAD","description":"","tax_gst":0.0,"tax_qst":0.0}
-date format: YYYY-MM-DD. amount: total amount paid. ONLY JSON."""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=500,
-            messages=[{"role":"user","content":[
-                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":img_b64}},
-                {"type":"text","text":prompt}
-            ]}]
+    rows = []
+    for index, category in enumerate(categories):
+        rows.append(
+            [{"text": category, "callback_data": f"category:{index}"}]
         )
-        result = ''.join(b.text for b in response.content if hasattr(b,'text'))
-        info = json.loads(result.replace('```json','').replace('```','').strip())
+    rows.append([{"text": "لغو", "callback_data": "cancel"}])
+    return rows
 
-        session = user_data.get(uid, {})
-        session['pending_expense'] = {
-            'merchant': info.get('merchant','—'),
-            'date': info.get('date') or datetime.now().strftime('%Y-%m-%d'),
-            'amount': float(info.get('amount') or 0),
-            'currency': info.get('currency','CAD'),
-            'description': info.get('description',''),
-            'tax_gst': float(info.get('tax_gst') or 0),
-            'tax_qst': float(info.get('tax_qst') or 0),
-        }
-        user_data[uid] = session
-        save_data()
 
-        exp = session['pending_expense']
-        msg = (f"🧾 *Reçu détecté*\n\n"
-               f"🏪 {exp['merchant']}\n"
-               f"📅 {exp['date']}\n"
-               f"💰 ${exp['amount']:.2f} {exp['currency']}\n"
-               f"📝 {exp['description']}\n\n"
-               f"Cette dépense est *personnelle* ou *d'entreprise*?")
-        kb = [
-            [{'text':'🏢 Entreprise','callback_data':'type_company'},
-             {'text':'👤 Personnelle','callback_data':'type_personal'}]
-        ]
-        tg(chat_id, msg, kb)
+def download_receipt(file_id):
+    metadata = telegram("getFile", {"file_id": file_id})
+    file_path = metadata["result"]["file_path"]
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.content
 
-    except Exception as e:
-        import traceback
-        logger.error(f"do_extract_receipt error: {e}\n{traceback.format_exc()}")
-        tg(chat_id, "❌ Erreur extraction: " + str(e))
 
-# ── Generate monthly PDF report ─────────────────────────────────────────────
-def generate_pdf_report(uid, month, year):
-    uid = str(uid)
-    user_expenses = expenses.get(uid, [])
-    month_expenses = [e for e in user_expenses
-                      if e.get('date','').startswith(f"{year}-{month:02d}")]
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                            rightMargin=50, leftMargin=50,
-                            topMargin=60, bottomMargin=60)
-    story = []
-
-    def style(name, font='Helvetica', size=11, bold=False, color=colors.black, align='LEFT', space=6):
-        return ParagraphStyle(name, fontName=font+('-Bold' if bold else ''),
-                              fontSize=size, textColor=color,
-                              leading=size+4, spaceAfter=space,
-                              alignment={'LEFT':0,'CENTER':1,'RIGHT':2}[align])
-
-    title_s = style('title', size=18, bold=True, color=colors.HexColor('#2E7D32'), align='CENTER')
-    sub_s = style('sub', size=12, color=colors.grey, align='CENTER')
-    h2_s = style('h2', size=13, bold=True, color=colors.HexColor('#1B5E20'), space=4)
-    normal_s = style('normal', size=10)
-
-    story.append(Paragraph("📊 Rapport de Dépenses Mensuel", title_s))
-    story.append(Paragraph(f"Métra Structure Inc. — {datetime(year,month,1).strftime('%B %Y')}", sub_s))
-    story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor('#2E7D32'), spaceAfter=12))
-
-    if not month_expenses:
-        story.append(Paragraph("Aucune dépense enregistrée ce mois.", normal_s))
-        doc.build(story)
-        buf.seek(0)
-        return buf
-
-    # Summary by category
-    by_cat = {}
-    total = 0
-    for e in month_expenses:
-        cat = e.get('category', 'Autre')
-        by_cat[cat] = by_cat.get(cat, 0) + e.get('amount', 0)
-        total += e.get('amount', 0)
-
-    story.append(Paragraph(f"Total du mois: ${total:,.2f} CAD", h2_s))
-    story.append(Spacer(1,8))
-
-    # Table header
-    table_data = [['Catégorie', 'Montant', '%']]
-    for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
-        pct = (amt/total*100) if total else 0
-        table_data.append([cat, f"${amt:,.2f}", f"{pct:.1f}%"])
-    table_data.append(['TOTAL', f"${total:,.2f}", "100%"])
-
-    t = Table(table_data, colWidths=[3.5*inch, 1.5*inch, 1*inch])
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2E7D32')),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 10),
-        ('ROWBACKGROUNDS', (0,1), (-1,-2), [colors.white, colors.HexColor('#F1F8E9')]),
-        ('BACKGROUND', (0,-1), (-1,-1), colors.HexColor('#C8E6C9')),
-        ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#A5D6A7')),
-        ('ALIGN', (1,0), (-1,-1), 'RIGHT'),
-        ('PADDING', (0,0), (-1,-1), 6),
-    ]))
-    story.append(t)
-    story.append(Spacer(1,16))
-
-    # Expense detail
-    story.append(Paragraph("Détail des dépenses", h2_s))
-    detail_data = [['Date', 'Marchand', 'Catégorie', 'Type', 'Montant']]
-    for e in sorted(month_expenses, key=lambda x: x.get('date','')):
-        detail_data.append([
-            e.get('date',''),
-            (e.get('merchant','') or '')[:20],
-            (e.get('category','') or '')[:22],
-            'Cie' if e.get('expense_type')=='company' else 'Pers.',
-            f"${e.get('amount',0):,.2f}"
-        ])
-
-    dt = Table(detail_data, colWidths=[0.9*inch, 1.6*inch, 1.8*inch, 0.6*inch, 1*inch])
-    dt.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#388E3C')),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 9),
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F9FBE7')]),
-        ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor('#DCEDC8')),
-        ('ALIGN', (4,0), (4,-1), 'RIGHT'),
-        ('PADDING', (0,0), (-1,-1), 5),
-    ]))
-    story.append(dt)
-
-    doc.build(story)
-    buf.seek(0)
-    return buf
-
-# ── Generate Excel report ───────────────────────────────────────────────────
-def generate_excel_report(uid, month, year):
-    uid = str(uid)
-    user_expenses = expenses.get(uid, [])
-    month_expenses = [e for e in user_expenses
-                      if e.get('date','').startswith(f"{year}-{month:02d}")]
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Dépenses"
-
-    green = "2E7D32"
-    light = "F1F8E9"
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    green_fill = PatternFill("solid", fgColor=green)
-
-    headers = ['Date', 'Marchand', 'Description', 'Catégorie', 'Type', 'Montant (CAD)', 'TPS', 'TVQ']
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = green_fill
-        cell.alignment = Alignment(horizontal='center')
-
-    for row, e in enumerate(sorted(month_expenses, key=lambda x: x.get('date','')), 2):
-        ws.cell(row=row, column=1, value=e.get('date',''))
-        ws.cell(row=row, column=2, value=e.get('merchant',''))
-        ws.cell(row=row, column=3, value=e.get('description',''))
-        ws.cell(row=row, column=4, value=e.get('category',''))
-        ws.cell(row=row, column=5, value='Entreprise' if e.get('expense_type')=='company' else 'Personnelle')
-        ws.cell(row=row, column=6, value=e.get('amount',0)).number_format = '#,##0.00'
-        ws.cell(row=row, column=7, value=e.get('tax_gst',0)).number_format = '#,##0.00'
-        ws.cell(row=row, column=8, value=e.get('tax_qst',0)).number_format = '#,##0.00'
-        if row % 2 == 0:
-            for col in range(1,9):
-                ws.cell(row=row, column=col).fill = PatternFill("solid", fgColor=light)
-
-    # Summary sheet
-    ws2 = wb.create_sheet("Résumé")
-    by_cat = {}
-    total = 0
-    for e in month_expenses:
-        cat = e.get('category','Autre')
-        by_cat[cat] = by_cat.get(cat,0) + e.get('amount',0)
-        total += e.get('amount',0)
-
-    ws2.cell(1,1,"Catégorie").font = header_font
-    ws2.cell(1,1).fill = green_fill
-    ws2.cell(1,2,"Montant").font = header_font
-    ws2.cell(1,2).fill = green_fill
-    for r, (cat,amt) in enumerate(sorted(by_cat.items(), key=lambda x:-x[1]), 2):
-        ws2.cell(r,1,cat)
-        ws2.cell(r,2,amt).number_format = '#,##0.00'
-
-    # Pie chart
-    if by_cat:
-        pie = PieChart()
-        pie.title = f"Dépenses {datetime(year,month,1).strftime('%B %Y')}"
-        data = Reference(ws2, min_col=2, min_row=1, max_row=len(by_cat)+1)
-        cats = Reference(ws2, min_col=1, min_row=2, max_row=len(by_cat)+1)
-        pie.add_data(data, titles_from_data=True)
-        pie.set_categories(cats)
-        pie.style = 10
-        ws2.add_chart(pie, "D2")
-
-    out = '/tmp/report.xlsx'
-    wb.save(out)
-    with open(out, 'rb') as f:
-        buf = io.BytesIO(f.read())
-    os.remove(out)
-    buf.seek(0)
-    return buf
-
-# ── Handle update ───────────────────────────────────────────────────────────
-def handle_update(data):
+def extract_receipt(image_bytes):
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    prompt = """
+Extract bookkeeping data from this Canadian receipt or invoice.
+Return only valid JSON with this exact schema:
+{
+  "merchant": "string",
+  "date": "YYYY-MM-DD",
+  "subtotal": 0.0,
+  "gst": 0.0,
+  "qst": 0.0,
+  "total": 0.0,
+  "currency": "CAD",
+  "description": "short string"
+}
+Use 0 for taxes that are not shown. Do not estimate a tax that is not visible.
+The total must be the amount paid. If the date is unclear, return an empty string.
+"""
+    response = Anthropic(api_key=ANTHROPIC_API_KEY).messages.create(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        max_tokens=700,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    )
+    raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    parsed = json.loads(raw)
+    extracted_date = str(parsed.get("date") or "")
     try:
-        msg = data.get('message', {})
-        cb = data.get('callback_query', {})
+        datetime.strptime(extracted_date, "%Y-%m-%d")
+    except ValueError:
+        extracted_date = datetime.now().strftime("%Y-%m-%d")
+    return {
+        "merchant": str(parsed.get("merchant") or "Unknown"),
+        "date": extracted_date,
+        "subtotal": float(parsed.get("subtotal") or 0),
+        "gst": float(parsed.get("gst") or 0),
+        "qst": float(parsed.get("qst") or 0),
+        "total": float(parsed.get("total") or 0),
+        "currency": str(parsed.get("currency") or "CAD").upper(),
+        "description": str(parsed.get("description") or ""),
+    }
 
-        if cb:
-            uid = str(cb['from']['id'])
-            chat_id = cb['message']['chat']['id']
-            cdata = cb.get('data','')
-            try:
-                req.post(f'https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery',
-                         json={'callback_query_id': cb['id']}, timeout=3)
-            except: pass
 
-            session = user_data.get(uid, {})
-            pending = session.get('pending_expense', {})
+def receipt_summary(data):
+    return (
+        "🧾 <b>اطلاعات رسید</b>\n\n"
+        f"فروشنده: {safe(data['merchant'])}\n"
+        f"تاریخ: {safe(data['date'])}\n"
+        f"قبل از مالیات: ${data['subtotal']:.2f}\n"
+        f"GST: ${data['gst']:.2f}\n"
+        f"QST: ${data['qst']:.2f}\n"
+        f"<b>جمع: ${data['total']:.2f} {safe(data['currency'])}</b>\n\n"
+        "این هزینه مربوط به شرکت است یا شخصی؟"
+    )
 
-            if cdata == 'type_company':
-                pending['expense_type'] = 'company'
-                session['pending_expense'] = pending
-                session['current_categories'] = COMPANY_CATEGORIES
-                user_data[uid] = session
-                save_data()
-                kb = category_keyboard(COMPANY_CATEGORIES)
-                kb.append([{'text':'🔄 Nouveau reçu','callback_data':'nouveau'}])
-                tg(chat_id, "📂 *Catégorie* (entreprise):", kb)
 
-            elif cdata == 'type_personal':
-                pending['expense_type'] = 'personal'
-                session['pending_expense'] = pending
-                session['current_categories'] = PERSONAL_CATEGORIES
-                user_data[uid] = session
-                save_data()
-                kb = category_keyboard(PERSONAL_CATEGORIES)
-                kb.append([{'text':'🔄 Nouveau reçu','callback_data':'nouveau'}])
-                tg(chat_id, "📂 *Catégorie* (personnelle):", kb)
+def save_expense(user_id, payload):
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO expenses(
+                user_id, merchant, expense_date, subtotal, gst, qst, total,
+                currency, description, expense_type, category, project_code,
+                receipt_hash, receipt_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                payload["merchant"],
+                payload["date"],
+                payload["subtotal"],
+                payload["gst"],
+                payload["qst"],
+                payload["total"],
+                payload["currency"],
+                payload["description"],
+                payload["expense_type"],
+                payload["category"],
+                payload.get("project_code"),
+                payload["receipt_hash"],
+                payload.get("receipt_path"),
+                datetime.utcnow().isoformat(),
+            ),
+        )
 
-            elif cdata.startswith('cat_'):
-                idx = int(cdata.split('_')[1])
-                cats = session.get('current_categories', COMPANY_CATEGORIES)
-                if idx < len(cats):
-                    pending['category'] = cats[idx]
-                    # Save expense
-                    uid_expenses = expenses.get(uid, [])
-                    uid_expenses.append(pending)
-                    expenses[uid] = uid_expenses
-                    session['pending_expense'] = {}
-                    user_data[uid] = session
-                    save_data()
-                    exp = pending
-                    tg(chat_id,
-                       f"✅ *Dépense enregistrée!*\n\n"
-                       f"🏪 {exp.get('merchant','—')}\n"
-                       f"💰 ${exp.get('amount',0):.2f} CAD\n"
-                       f"📂 {exp.get('category','—')}\n"
-                       f"📅 {exp.get('date','—')}\n\n"
-                       "Total ce mois (" + datetime.now().strftime('%B %Y') + f"): ${sum(e['amount'] for e in expenses.get(uid,[]) if e.get('date','').startswith(datetime.now().strftime('%Y-%m'))):.2f} CAD",
-                       [[{'text':'📸 Nouveau reçu','callback_data':'nouveau'},
-                         {'text':'📊 Rapport mensuel','callback_data':'report'}]])
 
-            elif cdata == 'report':
-                # Show last 6 months to choose from
-                now = datetime.now()
-                kb = []
-                for i in range(6):
-                    m = now.month - i
-                    y = now.year
-                    if m <= 0:
-                        m += 12
-                        y -= 1
-                    from calendar import month_abbr
-                    label = f"{month_abbr[m]} {y}"
-                    kb.append([{'text': f'📅 {label}', 'callback_data': f'report_{m}_{y}'}])
-                kb.append([{'text': '🔄 Nouveau reçu', 'callback_data': 'nouveau'}])
-                tg(chat_id, "📊 Choisissez le mois:", kb)
+def make_excel(user_id, year, month):
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM expenses
+            WHERE user_id=? AND substr(expense_date, 1, 7)=?
+            ORDER BY expense_date, id
+            """,
+            (user_id, f"{year:04d}-{month:02d}"),
+        ).fetchall()
 
-            elif cdata == 'nouveau':
-                session['pending_expense'] = {}
-                user_data[uid] = session
-                save_data()
-                tg(chat_id, "📸 Envoyez une photo du reçu ou facture.")
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Expenses"
+    headers = [
+        "Date",
+        "Merchant",
+        "Description",
+        "Type",
+        "Category",
+        "Project",
+        "Subtotal",
+        "GST",
+        "QST",
+        "Total",
+        "Currency",
+    ]
+    sheet.append(headers)
+    navy = "102A43"
+    orange = "F5A623"
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=navy)
+        cell.alignment = Alignment(horizontal="center")
 
-            elif cdata.startswith('report_'):
-                parts = cdata.split('_')
-                m, y = int(parts[1]), int(parts[2])
-                do_report(chat_id, uid, m, y)
+    for row in rows:
+        sheet.append(
+            [
+                row["expense_date"],
+                row["merchant"],
+                row["description"],
+                row["expense_type"],
+                row["category"],
+                row["project_code"] or "",
+                row["subtotal"],
+                row["gst"],
+                row["qst"],
+                row["total"],
+                row["currency"],
+            ]
+        )
 
-        elif msg:
-            uid = str(msg['from']['id'])
-            chat_id = msg['chat']['id']
+    for column in "GHIJ":
+        for cell in sheet[column][1:]:
+            cell.number_format = '$#,##0.00'
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    widths = [12, 24, 32, 12, 28, 16, 14, 12, 12, 14, 10]
+    for index, width in enumerate(widths, 1):
+        sheet.column_dimensions[openpyxl.utils.get_column_letter(index)].width = width
 
-            if msg.get('text'):
-                text = msg['text']
-                if text in ('/start', '/nouveau'):
-                    session = user_data.get(uid, {})
-                    session['pending_expense'] = {}
-                    user_data[uid] = session
-                    save_data()
-                    tg(chat_id,
-                       "👋 *Bienvenue — Métra Finance*\n\n"
-                       "📸 Envoyez une photo de votre reçu ou facture\n"
-                       "📊 /rapport — Rapport mensuel\n"
-                       "🔄 /nouveau — Nouveau reçu",
-                       [[{'text':'📊 Rapport ce mois','callback_data':'report'},
-                         {'text':'📸 Scanner un reçu','callback_data':'nouveau'}]])
-                elif text == '/rapport':
-                    now = datetime.now()
-                    from calendar import month_abbr
-                    kb = []
-                    for i in range(6):
-                        m = now.month - i
-                        y = now.year
-                        if m <= 0:
-                            m += 12
-                            y -= 1
-                        label = f"{month_abbr[m]} {y}"
-                        kb.append([{'text': f'📅 {label}', 'callback_data': f'report_{m}_{y}'}])
-                    tg(chat_id, "📊 Choisissez le mois:", kb)
-                else:
-                    tg(chat_id, "📸 Envoyez une photo du reçu.\n/rapport pour voir le rapport mensuel.")
+    summary = workbook.create_sheet("Summary")
+    summary.append(["Metric", "Amount"])
+    summary.append(["Subtotal", sum(row["subtotal"] for row in rows)])
+    summary.append(["GST", sum(row["gst"] for row in rows)])
+    summary.append(["QST", sum(row["qst"] for row in rows)])
+    summary.append(["Total", sum(row["total"] for row in rows)])
+    for cell in summary[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=orange)
+    for cell in summary["B"][1:]:
+        cell.number_format = '$#,##0.00'
+    summary.column_dimensions["A"].width = 22
+    summary.column_dimensions["B"].width = 16
 
-            elif msg.get('photo'):
-                file_id = msg['photo'][-1]['file_id']
-                tg(chat_id, "🔍 Analyse du reçu en cours...")
-                executor.submit(do_extract_receipt, chat_id, uid, file_id)
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output, len(rows)
 
-    except Exception as e:
-        import traceback
-        logger.error(f"handle_update error: {e}\n{traceback.format_exc()}")
 
-def do_report(chat_id, uid, month, year):
-    uid = str(uid)
-    tg(chat_id, f"⏳ Génération du rapport {datetime(year,month,1).strftime('%B %Y')}...")
+def send_excel(chat_id, user_id, year, month):
+    output, count = make_excel(user_id, year, month)
+    filename = f"Metra_Bookkeeping_{year:04d}-{month:02d}.xlsx"
+    response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+        data={
+            "chat_id": chat_id,
+            "caption": f"گزارش {year:04d}-{month:02d} — {count} سند",
+        },
+        files={
+            "document": (
+                filename,
+                output.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+
+
+def report_keyboard():
+    now = datetime.now()
+    rows = []
+    year, month = now.year, now.month
+    for _ in range(12):
+        rows.append(
+            [
+                {
+                    "text": f"{year:04d}-{month:02d}",
+                    "callback_data": f"report:{year}:{month}",
+                }
+            ]
+        )
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return rows
+
+
+def handle_photo(message):
+    user_id = message["from"]["id"]
+    chat_id = message["chat"]["id"]
+    send_message(chat_id, "🔎 رسید در حال بررسی است…")
+    image_bytes = download_receipt(message["photo"][-1]["file_id"])
+    digest = hashlib.sha256(image_bytes).hexdigest()
+
+    with db() as connection:
+        duplicate = connection.execute(
+            "SELECT id, merchant, total FROM expenses WHERE user_id=? AND receipt_hash=?",
+            (user_id, digest),
+        ).fetchone()
+    if duplicate:
+        send_message(
+            chat_id,
+            f"⚠️ این رسید قبلاً ثبت شده است: {safe(duplicate['merchant'])} — "
+            f"${duplicate['total']:.2f}",
+        )
+        return
+
+    extension = ".jpg"
+    receipt_path = RECEIPT_DIR / f"{user_id}_{digest[:20]}{extension}"
+    receipt_path.write_bytes(image_bytes)
+    data = extract_receipt(image_bytes)
+    data["receipt_hash"] = digest
+    data["receipt_path"] = str(receipt_path)
+    set_session(user_id, "choose_type", data)
+    send_message(
+        chat_id,
+        receipt_summary(data),
+        [
+            [
+                {"text": "🏢 شرکت", "callback_data": "type:company"},
+                {"text": "👤 شخصی", "callback_data": "type:personal"},
+            ],
+            [{"text": "لغو", "callback_data": "cancel"}],
+        ],
+    )
+
+
+def handle_callback(callback):
+    answer_callback(callback["id"])
+    user_id = callback["from"]["id"]
+    chat_id = callback["message"]["chat"]["id"]
+    if not is_allowed(user_id):
+        send_message(chat_id, "⛔️ دسترسی مجاز نیست.")
+        return
+
+    action = callback.get("data", "")
+    step, payload = get_session(user_id)
+
+    if action == "cancel":
+        set_session(user_id)
+        send_message(chat_id, "لغو شد.")
+        return
+
+    if action.startswith("type:") and step == "choose_type":
+        expense_type = action.split(":", 1)[1]
+        payload["expense_type"] = expense_type
+        categories = (
+            COMPANY_CATEGORIES if expense_type == "company" else PERSONAL_CATEGORIES
+        )
+        payload["categories"] = categories
+        set_session(user_id, "choose_category", payload)
+        send_message(chat_id, "دسته هزینه را انتخاب کن:", category_keyboard(categories))
+        return
+
+    if action.startswith("category:") and step == "choose_category":
+        index = int(action.split(":", 1)[1])
+        categories = payload.get("categories", [])
+        if index >= len(categories):
+            raise ValueError("Invalid category")
+        payload["category"] = categories[index]
+        payload.pop("categories", None)
+        if payload.get("expense_type") == "personal":
+            payload["project_code"] = None
+            save_expense(user_id, payload)
+            set_session(user_id)
+            send_message(chat_id, "✅ هزینه شخصی با موفقیت ثبت شد.")
+            return
+        set_session(user_id, "enter_project", payload)
+        send_message(
+            chat_id,
+            "کد پروژه را بنویس؛ مثلاً <b>ODS26-076</b>.\n"
+            "اگر هزینه عمومی شرکت است، دکمه زیر را بزن.",
+            [[{"text": "هزینه عمومی شرکت", "callback_data": "project:none"}]],
+        )
+        return
+
+    if action == "project:none" and step == "enter_project":
+        payload["project_code"] = None
+        save_expense(user_id, payload)
+        set_session(user_id)
+        send_message(chat_id, "✅ هزینه با موفقیت ثبت شد.")
+        return
+
+    if action.startswith("report:"):
+        _, year, month = action.split(":")
+        send_excel(chat_id, user_id, int(year), int(month))
+        return
+
+
+def handle_message(message):
+    user_id = message["from"]["id"]
+    chat_id = message["chat"]["id"]
+    if not is_allowed(user_id):
+        send_message(chat_id, "⛔️ این ربات خصوصی است.")
+        return
+
+    text = message.get("text", "").strip()
+    step, payload = get_session(user_id)
+
+    if text in {"/start", "/help"}:
+        send_message(
+            chat_id,
+            "👋 <b>ایجنت حسابداری Métra Structure</b>\n\n"
+            "عکس رسید یا فاکتور را بفرست.\n"
+            "/report — گزارش Excel\n"
+            "/cancel — لغو عملیات جاری",
+        )
+    elif text == "/cancel":
+        set_session(user_id)
+        send_message(chat_id, "لغو شد.")
+    elif text == "/report":
+        send_message(chat_id, "ماه گزارش را انتخاب کن:", report_keyboard())
+    elif step == "enter_project" and text:
+        payload["project_code"] = text.upper()[:50]
+        save_expense(user_id, payload)
+        set_session(user_id)
+        send_message(
+            chat_id,
+            f"✅ هزینه برای پروژه <b>{safe(payload['project_code'])}</b> ثبت شد.",
+        )
+    elif message.get("photo"):
+        handle_photo(message)
+    else:
+        send_message(chat_id, "عکس رسید را بفرست یا از /report استفاده کن.")
+
+
+def process_update(update):
     try:
-        buf_pdf = generate_pdf_report(uid, month, year)
-        month_str = datetime(year,month,1).strftime('%B-%Y')
-        tg_doc(chat_id, buf_pdf, f"Rapport_{month_str}.pdf", f"📊 Rapport PDF — {month_str}")
-        buf_xl = generate_excel_report(uid, month, year)
-        tg_doc(chat_id, buf_xl, f"Rapport_{month_str}.xlsx", f"📊 Rapport Excel — {month_str}")
-    except Exception as e:
-        import traceback
-        logger.error(f"do_report error: {e}\n{traceback.format_exc()}")
-        tg(chat_id, "❌ Erreur rapport: " + str(e))
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+        elif "message" in update:
+            handle_message(update["message"])
+    except sqlite3.IntegrityError:
+        logger.warning("Duplicate receipt rejected")
+        chat_id = (
+            update.get("message", {}).get("chat", {}).get("id")
+            or update.get("callback_query", {}).get("message", {}).get("chat", {}).get("id")
+        )
+        if chat_id:
+            send_message(chat_id, "⚠️ این رسید قبلاً ثبت شده است.")
+    except Exception:
+        logger.exception("Update processing failed")
+        chat_id = (
+            update.get("message", {}).get("chat", {}).get("id")
+            or update.get("callback_query", {}).get("message", {}).get("chat", {}).get("id")
+        )
+        if chat_id:
+            send_message(chat_id, "❌ پردازش انجام نشد. دوباره امتحان کن.")
 
-# ── Routes ──────────────────────────────────────────────────────────────────
-@app.route('/webhook/telegram', methods=['POST'])
+
+@app.post("/webhook/telegram")
 def webhook():
-    data = request.get_json(force=True, silent=True)
-    if data:
-        executor.submit(handle_update, data)
-    return 'ok', 200
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if supplied != WEBHOOK_SECRET:
+            return "forbidden", 403
+    update = request.get_json(silent=True)
+    if update:
+        executor.submit(process_update, update)
+    return "ok", 200
 
-@app.route('/setup')
+
+@app.get("/setup")
 def setup():
-    railway_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN','')
-    if not railway_url:
-        railway_url = 'metra-financial-bot.up.railway.app'
-    webhook_url = f"https://{railway_url}/webhook/telegram"
-    r = req.post(f'https://api.telegram.org/bot{BOT_TOKEN}/setWebhook',
-                 json={"url": webhook_url, "allowed_updates": ["message","callback_query"]}, timeout=15)
-    info = req.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo', timeout=10)
-    return jsonify({"set": r.json(), "info": info.json()})
+    if not SETUP_SECRET or request.args.get("key") != SETUP_SECRET:
+        return "forbidden", 403
+    if not PUBLIC_URL:
+        return jsonify({"error": "PUBLIC_URL is required"}), 400
+    payload = {
+        "url": f"{PUBLIC_URL}/webhook/telegram",
+        "allowed_updates": ["message", "callback_query"],
+    }
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    return jsonify(telegram("setWebhook", payload))
 
-@app.route('/')
-def index():
-    return jsonify({"status":"ok","bot":"@METRA_FINANCIAL_BOT"})
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+@app.get("/")
+def health():
+    return jsonify({"status": "ok", "service": "metra-accounting-bot"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
