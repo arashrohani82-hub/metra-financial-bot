@@ -16,6 +16,17 @@ from anthropic import Anthropic
 from flask import Flask, jsonify, request
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from project_control import (
+    create_project,
+    dashboard,
+    get_project,
+    init_project_control,
+    list_projects,
+    project_metrics,
+    record_money,
+    update_progress,
+)
+
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("metra_accounting")
@@ -115,6 +126,7 @@ def init_db():
             );
             """
         )
+        init_project_control(connection)
 
 
 init_db()
@@ -144,8 +156,10 @@ def send_message(chat_id, text, keyboard=None, reply_markup=None):
 def main_menu():
     return {
         "keyboard": [
-            [{"text": "🧾 رسید جدید"}, {"text": "📊 گزارش ماهانه"}],
-            [{"text": "❓ راهنما"}, {"text": "❌ لغو عملیات"}],
+            [{"text": "🎯 داشبورد"}, {"text": "📁 پروژه‌ها"}],
+            [{"text": "➕ پروژه جدید"}, {"text": "📈 ثبت پیشرفت"}],
+            [{"text": "💵 ثبت مالی"}, {"text": "🧾 رسید جدید"}],
+            [{"text": "📊 گزارش هزینه‌ها"}, {"text": "❌ لغو عملیات"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -501,6 +515,16 @@ def handle_callback(callback):
     action = callback.get("data", "")
     step, payload = get_session(user_id)
 
+    if action == "money:invoice":
+        set_session(user_id, "project_invoice", {})
+        send_message(chat_id, "شماره پروژه و مبلغ فاکتور را وارد کن:\n<code>P26-101 | 2500</code>")
+        return
+
+    if action == "money:payment":
+        set_session(user_id, "project_payment", {})
+        send_message(chat_id, "شماره پروژه و مبلغ دریافتی را وارد کن:\n<code>P26-101 | 2500</code>")
+        return
+
     if action == "cancel":
         set_session(user_id)
         send_message(chat_id, "لغو شد.")
@@ -552,6 +576,113 @@ def handle_callback(callback):
         return
 
 
+
+def money(value):
+    return f"${float(value or 0):,.2f}"
+
+
+def send_dashboard(chat_id, user_id):
+    with db() as connection:
+        data = dashboard(connection, user_id)
+    send_message(
+        chat_id,
+        "🎯 <b>داشبورد پروژه‌ها</b>\n\n"
+        f"پروژه‌های فعال: <b>{data['active_count']}</b>\n"
+        f"ارزش قراردادها: <b>{money(data['contract'])}</b>\n"
+        f"فاکتور شده: {money(data['invoiced'])}\n"
+        f"وصول شده: <b>{money(data['collected'])}</b>\n"
+        f"مطالبات باز: {money(data['outstanding'])}\n"
+        f"کار انجام‌شده ولی فاکتور نشده: {money(data['billing_gap'])}\n"
+        f"کمیسیون معرفِ ایجادشده: {money(data['commissions'])}\n"
+        f"موارد نیازمند توجه: <b>{data['at_risk']}</b>",
+        reply_markup=main_menu(),
+    )
+
+
+def send_project_list(chat_id, user_id):
+    with db() as connection:
+        projects = list_projects(connection, user_id)
+    if not projects:
+        send_message(chat_id, "هنوز پروژه فعالی ثبت نشده است.", reply_markup=main_menu())
+        return
+    lines = ["📁 <b>پروژه‌های فعال</b>\n"]
+    for project in projects[:20]:
+        item = project_metrics(project)
+        warning = " 🔴" if item["billing_gap"] > max(250, item["contract"] * 0.1) else ""
+        lines.append(
+            f"<b>{safe(project['project_code'])}</b> — {safe(project['title'])}{warning}\n"
+            f"پیشرفت {item['progress']:.0f}٪ | فاکتور {money(item['invoiced'])} | "
+            f"وصول {money(item['collected'])}"
+        )
+    send_message(chat_id, "\n\n".join(lines), reply_markup=main_menu())
+
+
+def begin_new_project(chat_id, user_id):
+    set_session(user_id, "new_project", {})
+    send_message(
+        chat_id,
+        "➕ <b>پروژه جدید</b>\n\n"
+        "اطلاعات را در یک خط و با | جدا کن:\n"
+        "<code>شماره پروژه | عنوان | مشتری | مبلغ قرارداد | معرف | درصد</code>\n\n"
+        "مثال:\n"
+        "<code>P26-101 | Inspection façade | ABC Inc. | 10000 | Habitation | 15</code>\n\n"
+        "اگر معرف ندارد، دو قسمت آخر را خالی بگذار.",
+    )
+
+
+def handle_new_project_text(chat_id, user_id, text):
+    parts = [part.strip() for part in text.split("|")]
+    if len(parts) < 4:
+        send_message(chat_id, "❌ حداقل چهار بخش لازم است: شماره | عنوان | مشتری | مبلغ")
+        return
+    referrer = parts[4] if len(parts) > 4 else ""
+    rate = parts[5] if len(parts) > 5 and parts[5] else 0
+    with db() as connection:
+        create_project(
+            connection, user_id, parts[0], parts[1], parts[2],
+            float(parts[3].replace(",", "")), referrer, float(rate)
+        )
+    set_session(user_id)
+    send_message(
+        chat_id,
+        f"✅ پروژه <b>{safe(parts[0].upper())}</b> ثبت شد.\n"
+        "اکنون می‌توانی پیشرفت، فاکتور و پرداخت آن را ثبت کنی.",
+        reply_markup=main_menu(),
+    )
+
+
+def handle_progress_text(chat_id, user_id, text):
+    parts = [part.strip() for part in text.split("|")]
+    if len(parts) != 2:
+        send_message(chat_id, "❌ فرمت درست: <code>P26-101 | 40</code>")
+        return
+    with db() as connection:
+        update_progress(connection, user_id, parts[0], float(parts[1]))
+    set_session(user_id)
+    send_message(
+        chat_id,
+        f"✅ پیشرفت پروژه <b>{safe(parts[0].upper())}</b> روی {float(parts[1]):.0f}٪ ثبت شد.",
+        reply_markup=main_menu(),
+    )
+
+
+def handle_money_text(chat_id, user_id, text, event_type):
+    parts = [part.strip() for part in text.split("|")]
+    if len(parts) != 2:
+        send_message(chat_id, "❌ فرمت درست: <code>P26-101 | 2500</code>")
+        return
+    amount = float(parts[1].replace(",", ""))
+    with db() as connection:
+        record_money(connection, user_id, parts[0], event_type, amount)
+    set_session(user_id)
+    label = "فاکتور" if event_type == "invoice" else "دریافت"
+    send_message(
+        chat_id,
+        f"✅ {label} {money(amount)} برای پروژه <b>{safe(parts[0].upper())}</b> ثبت شد.",
+        reply_markup=main_menu(),
+    )
+
+
 def handle_message(message):
     user_id = message["from"]["id"]
     chat_id = message["chat"]["id"]
@@ -564,10 +695,28 @@ def handle_message(message):
 
     if text in {"/start", "/help", "❓ راهنما"}:
         send_welcome(chat_id)
+    elif text in {"/dashboard", "🎯 داشبورد"}:
+        send_dashboard(chat_id, user_id)
+    elif text in {"/projects", "📁 پروژه‌ها"}:
+        send_project_list(chat_id, user_id)
+    elif text in {"/project", "➕ پروژه جدید"}:
+        begin_new_project(chat_id, user_id)
+    elif text in {"/progress", "📈 ثبت پیشرفت"}:
+        set_session(user_id, "project_progress", {})
+        send_message(chat_id, "شماره پروژه و درصد پیشرفت را وارد کن:\n<code>P26-101 | 40</code>")
+    elif text in {"/money", "💵 ثبت مالی"}:
+        send_message(
+            chat_id,
+            "چه چیزی ثبت شود؟",
+            [[
+                {"text": "📄 فاکتور صادرشده", "callback_data": "money:invoice"},
+                {"text": "💰 مبلغ وصول‌شده", "callback_data": "money:payment"},
+            ]],
+        )
     elif text in {"/cancel", "❌ لغو عملیات"}:
         set_session(user_id)
         send_message(chat_id, "لغو شد.", reply_markup=main_menu())
-    elif text in {"/report", "📊 گزارش ماهانه"}:
+    elif text in {"/report", "📊 گزارش ماهانه", "📊 گزارش هزینه‌ها"}:
         send_message(chat_id, "ماه گزارش را انتخاب کن:", report_keyboard())
     elif text in {"/new", "🧾 رسید جدید"}:
         set_session(user_id)
@@ -576,6 +725,14 @@ def handle_message(message):
             "📷 عکس واضح رسید یا فاکتور را همین‌جا ارسال کن.",
             reply_markup=main_menu(),
         )
+    elif step == "new_project" and text:
+        handle_new_project_text(chat_id, user_id, text)
+    elif step == "project_progress" and text:
+        handle_progress_text(chat_id, user_id, text)
+    elif step == "project_invoice" and text:
+        handle_money_text(chat_id, user_id, text, "invoice")
+    elif step == "project_payment" and text:
+        handle_money_text(chat_id, user_id, text, "payment")
     elif step == "enter_project" and text:
         payload["project_code"] = text.upper()[:50]
         save_expense(user_id, payload)
@@ -644,8 +801,13 @@ def setup():
         {
             "commands": [
                 {"command": "start", "description": "شروع و نمایش منوی اصلی"},
+                {"command": "project", "description": "ثبت پروژه جدید"},
+                {"command": "projects", "description": "فهرست پروژه‌ها"},
+                {"command": "dashboard", "description": "داشبورد مدیریت"},
+                {"command": "progress", "description": "ثبت پیشرفت پروژه"},
+                {"command": "money", "description": "ثبت فاکتور یا وصول"},
                 {"command": "new", "description": "ثبت رسید جدید"},
-                {"command": "report", "description": "دریافت گزارش ماهانه"},
+                {"command": "report", "description": "گزارش هزینه‌ها"},
                 {"command": "help", "description": "راهنمای استفاده"},
                 {"command": "cancel", "description": "لغو عملیات جاری"},
             ]
