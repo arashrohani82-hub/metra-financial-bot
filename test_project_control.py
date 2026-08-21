@@ -6,6 +6,7 @@ from project_control import (
     init_project_control,
     project_metrics,
     record_money,
+    set_monthly_target,
     update_progress,
 )
 
@@ -56,3 +57,16 @@ def test_referral_requires_name():
         assert "referrer" in str(exc)
     else:
         raise AssertionError("Expected ValueError")
+
+
+def test_monthly_collection_target():
+    db = connection()
+    create_project(db, 123, "P26-104", "Design", "Client", 10000)
+    record_money(db, 123, "P26-104", "payment", 15000)
+    set_monthly_target(db, 123, 60000)
+
+    data = dashboard(db, 123)
+
+    assert data["collection_target"] == 60000
+    assert data["target_achievement"] == 25
+    assert data["target_remaining"] == 45000
