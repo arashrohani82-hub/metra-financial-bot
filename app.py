@@ -24,6 +24,7 @@ from project_control import (
     list_projects,
     project_metrics,
     record_money,
+    set_monthly_target,
     update_progress,
 )
 
@@ -158,8 +159,9 @@ def main_menu():
         "keyboard": [
             [{"text": "🎯 داشبورد"}, {"text": "📁 پروژه‌ها"}],
             [{"text": "➕ پروژه جدید"}, {"text": "📈 ثبت پیشرفت"}],
-            [{"text": "💵 ثبت مالی"}, {"text": "🧾 رسید جدید"}],
-            [{"text": "📊 گزارش هزینه‌ها"}, {"text": "❌ لغو عملیات"}],
+            [{"text": "🎯 تعیین تارگت"}, {"text": "💵 ثبت مالی"}],
+            [{"text": "🧾 رسید جدید"}, {"text": "📊 گزارش هزینه‌ها"}],
+            [{"text": "❌ لغو عملیات"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -594,7 +596,10 @@ def send_dashboard(chat_id, user_id):
         f"مطالبات باز: {money(data['outstanding'])}\n"
         f"کار انجام‌شده ولی فاکتور نشده: {money(data['billing_gap'])}\n"
         f"کمیسیون معرفِ ایجادشده: {money(data['commissions'])}\n"
-        f"موارد نیازمند توجه: <b>{data['at_risk']}</b>",
+        f"موارد نیازمند توجه: <b>{data['at_risk']}</b>\n\n"
+        f"🎯 تارگت وصول {safe(data['month'])}: {money(data['collection_target'])}\n"
+        f"تحقق تارگت: <b>{data['target_achievement']:.1f}٪</b>\n"
+        f"مانده تا تارگت: {money(data['target_remaining'])}",
         reply_markup=main_menu(),
     )
 
@@ -666,6 +671,18 @@ def handle_progress_text(chat_id, user_id, text):
     )
 
 
+def handle_target_text(chat_id, user_id, text):
+    amount = float(text.replace(",", "").replace("$", "").strip())
+    with db() as connection:
+        set_monthly_target(connection, user_id, amount)
+    set_session(user_id)
+    send_message(
+        chat_id,
+        f"✅ تارگت وصول این ماه روی <b>{money(amount)}</b> تنظیم شد.",
+        reply_markup=main_menu(),
+    )
+
+
 def handle_money_text(chat_id, user_id, text, event_type):
     parts = [part.strip() for part in text.split("|")]
     if len(parts) != 2:
@@ -704,6 +721,9 @@ def handle_message(message):
     elif text in {"/progress", "📈 ثبت پیشرفت"}:
         set_session(user_id, "project_progress", {})
         send_message(chat_id, "شماره پروژه و درصد پیشرفت را وارد کن:\n<code>P26-101 | 40</code>")
+    elif text in {"/target", "🎯 تعیین تارگت"}:
+        set_session(user_id, "monthly_target", {})
+        send_message(chat_id, "مبلغ تارگت وصول این ماه را وارد کن؛ مثلاً <code>60000</code>")
     elif text in {"/money", "💵 ثبت مالی"}:
         send_message(
             chat_id,
@@ -729,6 +749,8 @@ def handle_message(message):
         handle_new_project_text(chat_id, user_id, text)
     elif step == "project_progress" and text:
         handle_progress_text(chat_id, user_id, text)
+    elif step == "monthly_target" and text:
+        handle_target_text(chat_id, user_id, text)
     elif step == "project_invoice" and text:
         handle_money_text(chat_id, user_id, text, "invoice")
     elif step == "project_payment" and text:
@@ -806,6 +828,7 @@ def setup():
                 {"command": "dashboard", "description": "داشبورد مدیریت"},
                 {"command": "progress", "description": "ثبت پیشرفت پروژه"},
                 {"command": "money", "description": "ثبت فاکتور یا وصول"},
+                {"command": "target", "description": "تعیین تارگت ماهانه"},
                 {"command": "new", "description": "ثبت رسید جدید"},
                 {"command": "report", "description": "گزارش هزینه‌ها"},
                 {"command": "help", "description": "راهنمای استفاده"},
