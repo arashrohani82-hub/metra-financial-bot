@@ -40,6 +40,14 @@ def init_project_control(connection):
 
         CREATE INDEX IF NOT EXISTS idx_projects_user_status
         ON projects(user_id, status);
+
+        CREATE TABLE IF NOT EXISTS monthly_targets (
+            user_id INTEGER NOT NULL,
+            month TEXT NOT NULL,
+            collection_target REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, month)
+        );
         """
     )
 
@@ -183,6 +191,21 @@ def project_metrics(project):
     }
 
 
+def set_monthly_target(connection, user_id, amount, month=None):
+    month = month or datetime.now().strftime("%Y-%m")
+    amount = max(0.0, float(amount))
+    connection.execute(
+        """
+        INSERT INTO monthly_targets(user_id, month, collection_target, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, month) DO UPDATE SET
+            collection_target=excluded.collection_target,
+            updated_at=excluded.updated_at
+        """,
+        (user_id, month, amount, _now()),
+    )
+
+
 def dashboard(connection, user_id):
     projects = list_projects(connection, user_id)
     metrics = [project_metrics(project) for project in projects]
@@ -192,6 +215,13 @@ def dashboard(connection, user_id):
     outstanding = sum(item["outstanding"] for item in metrics)
     billing_gap = sum(item["billing_gap"] for item in metrics)
     commissions = sum(item["referral_accrued"] for item in metrics)
+    month = datetime.now().strftime("%Y-%m")
+    target_row = connection.execute(
+        "SELECT collection_target FROM monthly_targets WHERE user_id=? AND month=?",
+        (user_id, month),
+    ).fetchone()
+    collection_target = float(target_row["collection_target"]) if target_row else 0.0
+    achievement = (collected / collection_target * 100) if collection_target else 0.0
     at_risk = sum(
         1
         for item in metrics
@@ -207,4 +237,8 @@ def dashboard(connection, user_id):
         "billing_gap": billing_gap,
         "commissions": commissions,
         "at_risk": at_risk,
+        "month": month,
+        "collection_target": collection_target,
+        "target_achievement": achievement,
+        "target_remaining": max(0.0, collection_target - collected),
     }
