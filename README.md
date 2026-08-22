@@ -11,11 +11,17 @@ Private Telegram bookkeeping assistant for Métra Structure Inc.
 - Stores bookkeeping data and receipt images on a persistent Railway volume.
 - Exports monthly Excel reports.
 - Restricts access to explicitly allowed Telegram user IDs.
+- Accepts RBC Mastercard PDF statements and tracks personal-card spending.
+- Uses April 2026 as the clean post-consolidation baseline by default.
+- Alerts on interest, fees, spending above budget and high credit utilization.
 
 ## Required Railway configuration
 
 Create a persistent volume mounted at `/data`, then configure the variables shown
 in `.env.example`. Never commit real tokens or API keys.
+
+`CARD_BASELINE_MONTH` controls the first month included in the personal-card
+dashboard. `CARD_MONTHLY_BUDGET` controls the monthly spending warning threshold.
 
 After deployment, register the Telegram webhook once:
 
