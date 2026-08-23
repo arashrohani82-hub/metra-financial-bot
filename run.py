@@ -1,10 +1,12 @@
 import hashlib
 import html
 import io
+import json
 import os
 import re
 from datetime import datetime
 
+import openpyxl
 from pypdf import PdfReader
 
 import app as core
@@ -38,6 +40,19 @@ with core.db() as connection:
             UNIQUE(user_id, source_hash),
             UNIQUE(user_id, statement_date, account_last4)
         );
+
+        CREATE TABLE IF NOT EXISTS personal_budget_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            statement_date TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            costco_spend REAL NOT NULL DEFAULT 0,
+            other_card_spend REAL NOT NULL DEFAULT 0,
+            chequing_spend REAL NOT NULL DEFAULT 0,
+            source_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, source_type, source_hash)
+        );
         """
     )
 
@@ -67,9 +82,135 @@ def _sum_keyword_amounts(lines, keyword_regex):
     return total
 
 
-def parse_rbc_chequing(pdf_bytes):
+def _pdf_text(pdf_bytes):
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _extract_json(raw):
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if not match:
+        raise ValueError("Budget analysis JSON was not found")
+    return json.loads(match.group(0))
+
+
+def analyze_card_budget(pdf_bytes):
+    text = _pdf_text(pdf_bytes)
+    prompt = """
+Analyze this RBC Mastercard statement only for the user's MONTHLY PERSONAL BUDGET CONTROL.
+Return only JSON exactly like this:
+{"costco_spend":0.0,"other_card_spend":0.0}
+
+Rules:
+1. costco_spend = all personal Costco Wholesale and Costco gasoline purchases in the statement period, net of Costco refunds.
+2. other_card_spend = all other personal discretionary purchases on the card, including Walmart, Metro, groceries, restaurants, personal retail and other personal day-to-day purchases.
+3. Exclude company/business expenses, card payments, cash transfers, refunds/credits that relate to excluded business items, purchase interest, fees, professional licensing, business software, business equipment, business marketing and other clearly business expenses.
+4. Do not count Costco again in other_card_spend.
+5. Use the transaction amounts printed on the statement. Do not estimate.
+
+STATEMENT TEXT:
+""" + text
+    response = core.Anthropic(api_key=core.ANTHROPIC_API_KEY).messages.create(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+    data = _extract_json(raw)
+    return {
+        "costco_spend": max(0.0, float(data.get("costco_spend") or 0)),
+        "other_card_spend": max(0.0, float(data.get("other_card_spend") or 0)),
+    }
+
+
+def analyze_chequing_budget(pdf_bytes):
+    text = _pdf_text(pdf_bytes)
+    prompt = """
+Analyze this RBC Chequing statement only for the user's MONTHLY DISCRETIONARY CHEQUING BUDGET.
+Return only JSON exactly like this:
+{"chequing_spend":0.0}
+
+Count only day-to-day personal purchases paid directly from chequing such as debit/contactless purchases and similar discretionary spending.
+Exclude all fixed commitments and money movements, including Toyota Finance, RBC loans, Fairstone or other loan payments, Garderie, Windsor, Bell, Videotron, Hydro, bank fees, overdraft interest, mortgage, credit-card payments, online banking transfers, BR TO BR transfers, e-Transfers sent or received, cash movements between own accounts, NSF fees and any company/business reimbursement.
+Use only printed transaction amounts. Do not estimate.
+
+STATEMENT TEXT:
+""" + text
+    response = core.Anthropic(api_key=core.ANTHROPIC_API_KEY).messages.create(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+    data = _extract_json(raw)
+    return {"chequing_spend": max(0.0, float(data.get("chequing_spend") or 0))}
+
+
+def save_budget_observation(user_id, statement_date, source_type, digest, costco=0.0, other=0.0, chequing=0.0):
+    with core.db() as connection:
+        connection.execute(
+            """
+            INSERT INTO personal_budget_observations(
+                user_id, statement_date, source_type, costco_spend,
+                other_card_spend, chequing_spend, source_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, source_type, source_hash) DO UPDATE SET
+                statement_date=excluded.statement_date,
+                costco_spend=excluded.costco_spend,
+                other_card_spend=excluded.other_card_spend,
+                chequing_spend=excluded.chequing_spend
+            """,
+            (
+                user_id, statement_date, source_type, costco, other, chequing,
+                digest, datetime.utcnow().isoformat(),
+            ),
+        )
+
+
+def _budget_status_line(label, actual, target):
+    percent = actual / target * 100 if target else 0
+    remaining = target - actual
+    if actual <= target:
+        return f"🟢 {label}: <b>${actual:,.2f} / ${target:,.0f}</b> — {percent:.0f}٪ — مانده ${remaining:,.2f}"
+    return f"🔴 {label}: <b>${actual:,.2f} / ${target:,.0f}</b> — {percent:.0f}٪ — اضافه ${abs(remaining):,.2f}"
+
+
+def budget_control_text(user_id, month=None):
+    with core.db() as connection:
+        params = [user_id]
+        where = "user_id=?"
+        if month:
+            where += " AND substr(statement_date, 1, 7)=?"
+            params.append(month)
+        rows = connection.execute(
+            f"SELECT * FROM personal_budget_observations WHERE {where} ORDER BY statement_date, id",
+            params,
+        ).fetchall()
+    if not rows:
+        return "\n\n🎯 <b>کنترل شاخص‌ها</b>\nهنوز داده کافی برای مقایسه ثبت نشده است."
+
+    card_rows = [r for r in rows if r["source_type"] == "card"]
+    cheq_rows = [r for r in rows if r["source_type"] == "chequing"]
+    card = card_rows[-1] if card_rows else None
+    cheq = cheq_rows[-1] if cheq_rows else None
+
+    lines = ["\n\n🎯 <b>کنترل شاخص‌های ماهانه</b>"]
+    if cheq:
+        lines.append(_budget_status_line("Chequing", cheq["chequing_spend"], core.PERSONAL_BUDGET_TARGETS["Chequing"]))
+    else:
+        lines.append("⚪ Chequing: صورت‌حساب این ماه ثبت نشده")
+    if card:
+        lines.append(_budget_status_line("Costco", card["costco_spend"], core.PERSONAL_BUDGET_TARGETS["Costco"]))
+        lines.append(_budget_status_line("Walmart + Metro + Other", card["other_card_spend"], core.PERSONAL_BUDGET_TARGETS["Walmart + Metro + Other"]))
+    else:
+        lines.append("⚪ Costco: صورت‌حساب کارت این ماه ثبت نشده")
+        lines.append("⚪ Walmart + Metro + Other: صورت‌حساب کارت این ماه ثبت نشده")
+    return "\n".join(lines)
+
+
+def parse_rbc_chequing(pdf_bytes):
+    text = _pdf_text(pdf_bytes)
     compact = re.sub(r"[ \t]+", " ", text)
     if "RBC personal banking" not in compact or "Total deposits into your account" not in compact:
         raise ValueError("This is not an RBC personal chequing statement")
@@ -136,7 +277,7 @@ def save_chequing_statement(user_id, data, digest, source_path):
         )
 
 
-def chequing_statement_summary(data):
+def chequing_statement_summary(data, user_id=None):
     net = data["total_deposits"] - data["total_withdrawals"]
     safe_to_spend = data["closing_balance"] - CHEQUING_BUFFER_TARGET
     ratio = (data["total_withdrawals"] / data["total_deposits"] * 100) if data["total_deposits"] else 0
@@ -153,7 +294,7 @@ def chequing_statement_summary(data):
         alerts.append(f"🔴 بهره overdraft: ${data['overdraft_interest']:,.2f}")
     if data["nsf_count"] or data["nsf_fees"]:
         alerts.append(f"🔴 NSF: {data['nsf_count']} مورد / ${data['nsf_fees']:,.2f} کارمزد")
-    return (
+    result = (
         f"🏦 <b>RBC Chequing — {data['statement_date']}</b>\n\n"
         f"ورودی دوره: <b>${data['total_deposits']:,.2f}</b>\n"
         f"برداشت دوره: <b>${data['total_withdrawals']:,.2f}</b>\n"
@@ -164,6 +305,9 @@ def chequing_statement_summary(data):
         f"Overdraft interest: ${data['overdraft_interest']:,.2f}\n"
         f"NSF fees: ${data['nsf_fees']:,.2f}\n\n" + "\n".join(alerts)
     )
+    if user_id:
+        result += budget_control_text(user_id, data["statement_date"][:7])
+    return result
 
 
 def chequing_dashboard(user_id):
@@ -209,6 +353,7 @@ def chequing_dashboard(user_id):
         f"Overdraft interest مجموع: ${overdraft:,.2f}\n"
         f"NSF: {nsf_count} مورد / ${nsf_fees:,.2f}\n"
         f"وضعیت: {status}"
+        + budget_control_text(user_id, latest["statement_date"][:7])
     )
 
 
@@ -224,21 +369,123 @@ def handle_chequing_document(message, pdf_bytes=None):
     if pdf_bytes is None:
         pdf_bytes = core.download_telegram_file(document["file_id"])
     digest = hashlib.sha256(pdf_bytes).hexdigest()
+    data = parse_rbc_chequing(pdf_bytes)
+
     with core.db() as connection:
         duplicate = connection.execute(
             "SELECT statement_date FROM chequing_statements WHERE user_id=? AND source_hash=?",
             (user_id, digest),
         ).fetchone()
+
+    try:
+        budget = analyze_chequing_budget(pdf_bytes)
+        save_budget_observation(
+            user_id, data["statement_date"], "chequing", digest,
+            chequing=budget["chequing_spend"],
+        )
+    except Exception:
+        core.logger.exception("Chequing budget analysis failed")
+
     if duplicate:
-        core.send_message(chat_id, f"⚠️ صورت‌حساب {duplicate['statement_date']} قبلاً ثبت شده است.")
+        core.send_message(
+            chat_id,
+            f"⚠️ صورت‌حساب {duplicate['statement_date']} قبلاً ثبت شده است."
+            + budget_control_text(user_id, data["statement_date"][:7]),
+            reply_markup=main_menu(),
+        )
         core.set_session(user_id)
         return
-    data = parse_rbc_chequing(pdf_bytes)
+
     path = CHEQUING_DIR / f"{user_id}_{data['statement_date']}_{digest[:12]}.pdf"
     path.write_bytes(pdf_bytes)
     save_chequing_statement(user_id, data, digest, path)
     core.set_session(user_id)
-    core.send_message(chat_id, chequing_statement_summary(data), reply_markup=main_menu())
+    core.send_message(chat_id, chequing_statement_summary(data, user_id=user_id), reply_markup=main_menu())
+
+
+_original_card_handler = core.handle_card_document
+_original_card_dashboard = core.card_dashboard
+_original_make_excel = core.make_excel
+
+
+def handle_card_document_with_budget(message):
+    user_id = message["from"]["id"]
+    chat_id = message["chat"]["id"]
+    document = message["document"]
+    pdf_bytes = core.download_telegram_file(document["file_id"])
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
+    try:
+        data = core.parse_rbc_statement(pdf_bytes)
+        budget = analyze_card_budget(pdf_bytes)
+        save_budget_observation(
+            user_id, data["statement_date"], "card", digest,
+            costco=budget["costco_spend"], other=budget["other_card_spend"],
+        )
+    except Exception:
+        core.logger.exception("Card budget analysis failed")
+        data = None
+
+    _original_card_handler(message)
+    if data:
+        core.send_message(
+            chat_id,
+            budget_control_text(user_id, data["statement_date"][:7]),
+            reply_markup=main_menu(),
+        )
+
+
+def card_dashboard_with_budget(user_id):
+    base = _original_card_dashboard(user_id)
+    with core.db() as connection:
+        latest = connection.execute(
+            "SELECT statement_date FROM card_statements WHERE user_id=? ORDER BY statement_date DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    month = latest["statement_date"][:7] if latest else None
+    return base + budget_control_text(user_id, month)
+
+
+def make_excel_with_budget(user_id, year, month):
+    output, count = _original_make_excel(user_id, year, month)
+    output.seek(0)
+    workbook = openpyxl.load_workbook(output)
+    sheet = workbook["Summary"]
+    target_month = f"{year:04d}-{month:02d}"
+
+    with core.db() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM personal_budget_observations
+            WHERE user_id=? AND substr(statement_date,1,7)=?
+            ORDER BY statement_date, id
+            """,
+            (user_id, target_month),
+        ).fetchall()
+
+    card_rows = [r for r in rows if r["source_type"] == "card"]
+    cheq_rows = [r for r in rows if r["source_type"] == "chequing"]
+    card = card_rows[-1] if card_rows else None
+    cheq = cheq_rows[-1] if cheq_rows else None
+
+    sheet.append([])
+    sheet.append(["Budget control", "Actual", "Target", "Status"])
+    comparisons = [
+        ("Chequing", cheq["chequing_spend"] if cheq else None, core.PERSONAL_BUDGET_TARGETS["Chequing"]),
+        ("Costco", card["costco_spend"] if card else None, core.PERSONAL_BUDGET_TARGETS["Costco"]),
+        ("Walmart + Metro + Other", card["other_card_spend"] if card else None, core.PERSONAL_BUDGET_TARGETS["Walmart + Metro + Other"]),
+    ]
+    for label, actual, target in comparisons:
+        status = "NO DATA" if actual is None else ("OK" if actual <= target else "OVER")
+        sheet.append([label, actual if actual is not None else "", target, status])
+    sheet.column_dimensions["A"].width = 32
+    sheet.column_dimensions["B"].width = 16
+    sheet.column_dimensions["C"].width = 16
+    sheet.column_dimensions["D"].width = 12
+
+    updated = io.BytesIO()
+    workbook.save(updated)
+    updated.seek(0)
+    return updated, count
 
 
 def main_menu():
@@ -262,7 +509,7 @@ def send_welcome(chat_id):
         "🧾 رسید/فاکتور: عکس را بفرست.\n"
         "💳 Mastercard: PDF صورت‌حساب کارت را بفرست.\n"
         "🏦 RBC Chequing: PDF صورت‌حساب چکینگ را بفرست.\n"
-        "📊 کنترل چکینگ، Cash Flow، بافر و ریسک overdraft را پایش می‌کند.",
+        "🎯 گزارش‌ها هزینه واقعی را با سقف Chequing 300، Costco 600 و Walmart + Metro + Other 200 مقایسه می‌کنند.",
         reply_markup=main_menu(),
     )
 
@@ -287,6 +534,9 @@ def handle_message(message):
     if text in {"/chequing_control", "📊 کنترل چکینگ"}:
         core.send_message(chat_id, chequing_dashboard(user_id), reply_markup=main_menu())
         return
+    if text in {"/card", "📈 کنترل کارت"}:
+        core.send_message(chat_id, card_dashboard_with_budget(user_id), reply_markup=main_menu())
+        return
 
     if message.get("document"):
         document = message["document"]
@@ -303,6 +553,8 @@ def handle_message(message):
             if "RBC personal banking" in preview and "Total deposits into your account" in preview:
                 handle_chequing_document(message, pdf_bytes=pdf_bytes)
                 return
+            handle_card_document_with_budget(message)
+            return
 
     _old_handle_message(message)
 
@@ -310,5 +562,8 @@ def handle_message(message):
 core.main_menu = main_menu
 core.send_welcome = send_welcome
 core.handle_message = handle_message
+core.handle_card_document = handle_card_document_with_budget
+core.card_dashboard = card_dashboard_with_budget
+core.make_excel = make_excel_with_budget
 
 application = core.app
