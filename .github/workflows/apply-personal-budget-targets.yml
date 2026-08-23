@@ -1,0 +1,62 @@
+name: Apply personal budget targets
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch budget targets into bot reports
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('app.py')
+          text = path.read_text(encoding='utf-8')
+          original = text
+
+          marker = 'CARD_MONTHLY_BUDGET = float(os.getenv("CARD_MONTHLY_BUDGET", "5000"))\n'
+          addition = '''\nPERSONAL_BUDGET_TARGETS = {\n    "Chequing": 300.0,\n    "Costco": 600.0,\n    "Walmart + Metro + Other": 200.0,\n}\n\n'''
+          if 'PERSONAL_BUDGET_TARGETS = {' not in text:
+              text = text.replace(marker, marker + addition)
+
+          helper_marker = '\ndef card_statement_summary(data):\n'
+          helper = '''\ndef personal_budget_targets_text():\n    total = sum(PERSONAL_BUDGET_TARGETS.values())\n    return (\n        "\\n\\n🎯 <b>شاخص بودجه ماهانه</b>\\n"\n        f"Chequing: <b>$300</b>\\n"\n        f"Costco: <b>$600</b>\\n"\n        f"Walmart + Metro + Other: <b>$200</b>\\n"\n        f"جمع شاخص قابل کنترل: <b>${total:,.0f}</b>"\n    )\n\n'''
+          if 'def personal_budget_targets_text():' not in text:
+              text = text.replace(helper_marker, helper + helper_marker)
+
+          old_summary = '        + "\\n".join(alerts)\n    )'
+          new_summary = '        + "\\n".join(alerts)\n        + personal_budget_targets_text()\n    )'
+          if old_summary in text and 'alerts)\n        + personal_budget_targets_text()' not in text:
+              text = text.replace(old_summary, new_summary, 1)
+
+          old_dashboard = '        f"وضعیت: {status}"\n    )'
+          new_dashboard = '        f"وضعیت: {status}"\n        + personal_budget_targets_text()\n    )'
+          if old_dashboard in text and 'f"وضعیت: {status}"\n        + personal_budget_targets_text()' not in text:
+              text = text.replace(old_dashboard, new_dashboard, 1)
+
+          old_excel = '    summary.append(["Total", sum(row["total"] for row in rows)])\n'
+          new_excel = '''    summary.append(["Total", sum(row["total"] for row in rows)])\n    summary.append(["Budget target - Chequing", PERSONAL_BUDGET_TARGETS["Chequing"]])\n    summary.append(["Budget target - Costco", PERSONAL_BUDGET_TARGETS["Costco"]])\n    summary.append(["Budget target - Walmart + Metro + Other", PERSONAL_BUDGET_TARGETS["Walmart + Metro + Other"]])\n    summary.append(["Budget target - Controlled total", sum(PERSONAL_BUDGET_TARGETS.values())])\n'''
+          if 'Budget target - Chequing' not in text:
+              text = text.replace(old_excel, new_excel, 1)
+
+          if text != original:
+              path.write_text(text, encoding='utf-8')
+          PY
+      - name: Commit changes
+        run: |
+          if git diff --quiet; then
+            echo "No changes needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git commit -m "Set personal monthly budget indicators"
+          git push
