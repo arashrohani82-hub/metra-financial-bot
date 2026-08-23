@@ -47,6 +47,13 @@ DB_PATH = DATA_DIR / "accounting.db"
 CARD_BASELINE_MONTH = os.getenv("CARD_BASELINE_MONTH", "2026-04")
 CARD_MONTHLY_BUDGET = float(os.getenv("CARD_MONTHLY_BUDGET", "5000"))
 
+PERSONAL_BUDGET_TARGETS = {
+    "Chequing": 300.0,
+    "Costco": 600.0,
+    "Walmart + Metro + Other": 200.0,
+}
+
+
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -357,6 +364,17 @@ def save_card_statement(user_id, data, digest, source_path):
         )
 
 
+def personal_budget_targets_text():
+    total = sum(PERSONAL_BUDGET_TARGETS.values())
+    return (
+        "\n\n🎯 <b>شاخص بودجه ماهانه</b>\n"
+        f"Chequing: <b>$300</b>\n"
+        f"Costco: <b>$600</b>\n"
+        f"Walmart + Metro + Other: <b>$200</b>\n"
+        f"جمع شاخص قابل کنترل: <b>${total:,.0f}</b>"
+    )
+
+
 def card_statement_summary(data):
     utilization = (
         data["ending_balance"] / data["credit_limit"] * 100
@@ -384,6 +402,7 @@ def card_statement_summary(data):
         f"کارمزد: ${data['fees']:,.2f}\n"
         f"استفاده از سقف: {utilization:.1f}٪\n\n"
         + "\n".join(alerts)
+        + personal_budget_targets_text()
     )
 
 
@@ -425,6 +444,7 @@ def card_dashboard(user_id):
         f"آخرین مانده: ${latest['ending_balance']:,.2f}\n"
         f"استفاده از سقف: {utilization:.1f}٪\n"
         f"وضعیت: {status}"
+        + personal_budget_targets_text()
     )
 
 
@@ -622,6 +642,10 @@ def make_excel(user_id, year, month):
     summary.append(["GST", sum(row["gst"] for row in rows)])
     summary.append(["QST", sum(row["qst"] for row in rows)])
     summary.append(["Total", sum(row["total"] for row in rows)])
+    summary.append(["Budget target - Chequing", PERSONAL_BUDGET_TARGETS["Chequing"]])
+    summary.append(["Budget target - Costco", PERSONAL_BUDGET_TARGETS["Costco"]])
+    summary.append(["Budget target - Walmart + Metro + Other", PERSONAL_BUDGET_TARGETS["Walmart + Metro + Other"]])
+    summary.append(["Budget target - Controlled total", sum(PERSONAL_BUDGET_TARGETS.values())])
     for cell in summary[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor=orange)
