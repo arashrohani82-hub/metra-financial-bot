@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "deploy": {
-    "startCommand": "gunicorn named_run:application --timeout 300 --workers 2 --threads 4",
+    "startCommand": "gunicorn service:app --timeout 300 --workers 2 --threads 4",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
