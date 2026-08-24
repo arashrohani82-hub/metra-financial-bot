@@ -8,6 +8,7 @@ import time
 from flask import jsonify, request
 
 import app as accounting
+from receipt_ai import extract_receipt_resilient
 
 app = accounting.app
 logger = logging.getLogger("metra_bookkeeping_router")
@@ -27,7 +28,7 @@ def _extract_receipt_with_retry(image_bytes):
     last_error = None
     for attempt in range(2):
         try:
-            return accounting.extract_receipt(image_bytes)
+            return extract_receipt_resilient(image_bytes)
         except json.JSONDecodeError as exc:
             last_error = exc
             logger.warning("Malformed AI JSON while extracting receipt (attempt %s/2): %s", attempt + 1, exc)
@@ -38,7 +39,7 @@ def _extract_receipt_with_retry(image_bytes):
             last_error = exc
             logger.exception("Receipt extraction failed")
             break
-    raise RuntimeError(f"receipt_ai_json_error: {type(last_error).__name__}")
+    raise RuntimeError(f"receipt_ai_error: {type(last_error).__name__}: {str(last_error)[:120]}")
 
 
 @app.get("/status")
@@ -91,7 +92,7 @@ def router_receipt():
         return jsonify({
             "ok": False,
             "error": "receipt_processing_failed",
-            "detail": str(exc)[:180],
+            "detail": str(exc)[:220],
             "error_type": type(exc).__name__,
         }), 500
 
