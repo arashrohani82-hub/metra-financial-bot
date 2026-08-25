@@ -14,6 +14,12 @@ app = accounting.app
 logger = logging.getLogger("metra_bookkeeping_router")
 ROUTER_SHARED_SECRET = os.getenv("ROUTER_SHARED_SECRET", "").strip()
 
+# Ensure the Telegram receipt workflow uses the same resilient Anthropic model
+# selection as the router. This avoids failures when ANTHROPIC_MODEL points to
+# a retired/unavailable model such as claude-3-5-sonnet-20241022.
+accounting.extract_receipt = extract_receipt_resilient
+logger.info("Receipt AI override active: resilient Anthropic model selection")
+
 
 def _authorized_router_request():
     supplied = request.headers.get("X-Router-Secret", "")
