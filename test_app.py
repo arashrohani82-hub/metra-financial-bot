@@ -1,6 +1,9 @@
 import importlib
+import io
 import os
 import sys
+
+import openpyxl
 
 
 def load_app(tmp_path, monkeypatch):
@@ -102,3 +105,77 @@ def test_card_dashboard_uses_clean_baseline(tmp_path, monkeypatch):
     assert "تعداد دوره‌ها: 2" in dashboard
     assert "$11,535.90" in dashboard
     assert "مجموع بهره: <b>$0.00</b>" in dashboard
+
+
+def test_parse_odometer_accepts_common_formats(tmp_path, monkeypatch):
+    module = load_app(tmp_path, monkeypatch)
+
+    assert module.parse_odometer("84,520 km") == 84520
+    assert module.parse_odometer("۸۴۵۲۰") == 84520
+
+
+def test_fuel_receipt_requires_and_exports_odometer(tmp_path, monkeypatch):
+    module = load_app(tmp_path, monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        module,
+        "telegram",
+        lambda method, payload=None, **kwargs: sent.append((method, payload)),
+    )
+    receipt = {
+        "merchant": "Shell",
+        "date": "2026-09-01",
+        "subtotal": 86.98,
+        "gst": 4.35,
+        "qst": 8.68,
+        "total": 100.01,
+        "currency": "CAD",
+        "description": "Fuel",
+        "expense_type": "company",
+        "categories": ["Carburant et kilométrage"],
+        "receipt_hash": "fuel-receipt-1",
+        "receipt_path": "/data/fuel.jpg",
+    }
+    module.set_session(123, "choose_category", receipt)
+
+    module.handle_callback(
+        {
+            "id": "callback-1",
+            "from": {"id": 123},
+            "message": {"chat": {"id": 456}},
+            "data": "category:0",
+        }
+    )
+    step, payload = module.get_session(123)
+    assert step == "enter_odometer"
+    assert "کیلومتراژ" in sent[-1][1]["text"]
+
+    module.handle_message(
+        {"from": {"id": 123}, "chat": {"id": 456}, "text": "84,520 km"}
+    )
+    step, payload = module.get_session(123)
+    assert step == "enter_project"
+    assert payload["odometer_km"] == 84520
+
+    module.handle_callback(
+        {
+            "id": "callback-2",
+            "from": {"id": 123},
+            "message": {"chat": {"id": 456}},
+            "data": "project:none",
+        }
+    )
+    with module.db() as connection:
+        saved = connection.execute(
+            "SELECT category, odometer_km FROM expenses WHERE receipt_hash=?",
+            ("fuel-receipt-1",),
+        ).fetchone()
+    assert saved["category"] == "Carburant et kilométrage"
+    assert saved["odometer_km"] == 84520
+
+    output, count = module.make_excel(123, 2026, 9)
+    workbook = openpyxl.load_workbook(io.BytesIO(output.getvalue()))
+    sheet = workbook["Expenses"]
+    assert count == 1
+    assert sheet["G1"].value == "Odometer (km)"
+    assert sheet["G2"].value == 84520

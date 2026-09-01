@@ -58,6 +58,7 @@ app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 
 COMPANY_CATEGORIES = [
+    "Carburant et kilométrage",
     "Transport et véhicule",
     "Repas et représentation",
     "Bureau et loyer",
@@ -78,7 +79,8 @@ COMPANY_CATEGORIES = [
 PERSONAL_CATEGORIES = [
     "Épicerie et alimentation",
     "Restaurants et sorties",
-    "Transport et essence",
+    "Essence et kilométrage",
+    "Transport",
     "Logement et services",
     "Vêtements",
     "Santé et médical",
@@ -88,6 +90,13 @@ PERSONAL_CATEGORIES = [
     "Cadeaux et dons",
     "Autre dépense",
 ]
+
+FUEL_CATEGORIES = {
+    "Carburant et kilométrage",
+    "Essence et kilométrage",
+    # Keep the former category compatible with receipts already in progress.
+    "Transport et essence",
+}
 
 
 def db():
@@ -122,6 +131,7 @@ def init_db():
                 expense_type TEXT NOT NULL,
                 category TEXT NOT NULL,
                 project_code TEXT,
+                odometer_km INTEGER,
                 receipt_hash TEXT NOT NULL,
                 receipt_path TEXT,
                 created_at TEXT NOT NULL,
@@ -153,6 +163,11 @@ def init_db():
             );
             """
         )
+        expense_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(expenses)")
+        }
+        if "odometer_km" not in expense_columns:
+            connection.execute("ALTER TABLE expenses ADD COLUMN odometer_km INTEGER")
 
 
 init_db()
@@ -256,6 +271,48 @@ def category_keyboard(categories):
         )
     rows.append([{"text": "لغو", "callback_data": "cancel"}])
     return rows
+
+
+def is_fuel_category(category):
+    return category in FUEL_CATEGORIES
+
+
+def parse_odometer(text):
+    translated = str(text or "").translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    )
+    cleaned = re.sub(r"(?i)\b(?:km|kilometres?|kilometers?)\b", "", translated)
+    cleaned = cleaned.replace(",", "").replace(" ", "")
+    if not cleaned.isdigit():
+        raise ValueError("Odometer must be a whole number")
+    value = int(cleaned)
+    if value <= 0 or value > 9_999_999:
+        raise ValueError("Odometer is outside the accepted range")
+    return value
+
+
+def ask_for_project(chat_id, user_id, payload):
+    set_session(user_id, "enter_project", payload)
+    send_message(
+        chat_id,
+        "کد پروژه را بنویس؛ مثلاً <b>ODS26-076</b>.\n"
+        "اگر هزینه عمومی شرکت است، دکمه زیر را بزن.",
+        [[{"text": "هزینه عمومی شرکت", "callback_data": "project:none"}]],
+    )
+
+
+def finish_expense_after_category(chat_id, user_id, payload):
+    if payload.get("expense_type") == "personal":
+        payload["project_code"] = None
+        save_expense(user_id, payload)
+        set_session(user_id)
+        extra = (
+            f" کیلومتراژ: <b>{payload['odometer_km']:,} km</b>."
+            if payload.get("odometer_km") else ""
+        )
+        send_message(chat_id, f"✅ هزینه شخصی با موفقیت ثبت شد.{extra}")
+        return
+    ask_for_project(chat_id, user_id, payload)
 
 
 def download_receipt(file_id):
@@ -552,8 +609,8 @@ def save_expense(user_id, payload):
             INSERT INTO expenses(
                 user_id, merchant, expense_date, subtotal, gst, qst, total,
                 currency, description, expense_type, category, project_code,
-                receipt_hash, receipt_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                odometer_km, receipt_hash, receipt_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -568,6 +625,7 @@ def save_expense(user_id, payload):
                 payload["expense_type"],
                 payload["category"],
                 payload.get("project_code"),
+                payload.get("odometer_km"),
                 payload["receipt_hash"],
                 payload.get("receipt_path"),
                 datetime.utcnow().isoformat(),
@@ -596,6 +654,7 @@ def make_excel(user_id, year, month):
         "Type",
         "Category",
         "Project",
+        "Odometer (km)",
         "Subtotal",
         "GST",
         "QST",
@@ -619,6 +678,7 @@ def make_excel(user_id, year, month):
                 row["expense_type"],
                 row["category"],
                 row["project_code"] or "",
+                row["odometer_km"] or "",
                 row["subtotal"],
                 row["gst"],
                 row["qst"],
@@ -627,12 +687,12 @@ def make_excel(user_id, year, month):
             ]
         )
 
-    for column in "GHIJ":
+    for column in "HIJK":
         for cell in sheet[column][1:]:
             cell.number_format = '$#,##0.00'
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    widths = [12, 24, 32, 12, 28, 16, 14, 12, 12, 14, 10]
+    widths = [12, 24, 32, 12, 28, 16, 16, 14, 12, 12, 14, 10]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[openpyxl.utils.get_column_letter(index)].width = width
 
@@ -775,19 +835,15 @@ def handle_callback(callback):
             raise ValueError("Invalid category")
         payload["category"] = categories[index]
         payload.pop("categories", None)
-        if payload.get("expense_type") == "personal":
-            payload["project_code"] = None
-            save_expense(user_id, payload)
-            set_session(user_id)
-            send_message(chat_id, "✅ هزینه شخصی با موفقیت ثبت شد.")
+        if is_fuel_category(payload["category"]):
+            set_session(user_id, "enter_odometer", payload)
+            send_message(
+                chat_id,
+                "⛽️ کیلومتراژ فعلی خودرو را وارد کن.\n"
+                "مثال: <b>84520</b>",
+            )
             return
-        set_session(user_id, "enter_project", payload)
-        send_message(
-            chat_id,
-            "کد پروژه را بنویس؛ مثلاً <b>ODS26-076</b>.\n"
-            "اگر هزینه عمومی شرکت است، دکمه زیر را بزن.",
-            [[{"text": "هزینه عمومی شرکت", "callback_data": "project:none"}]],
-        )
+        finish_expense_after_category(chat_id, user_id, payload)
         return
 
     if action == "project:none" and step == "enter_project":
@@ -836,6 +892,17 @@ def handle_message(message):
             "📷 عکس واضح رسید یا فاکتور را همین‌جا ارسال کن.",
             reply_markup=main_menu(),
         )
+    elif step == "enter_odometer" and text:
+        try:
+            payload["odometer_km"] = parse_odometer(text)
+        except ValueError:
+            send_message(
+                chat_id,
+                "کیلومتراژ معتبر نیست. فقط عدد کیلومترشمار را وارد کن؛ "
+                "مثلاً <b>84520</b>.",
+            )
+            return
+        finish_expense_after_category(chat_id, user_id, payload)
     elif step == "enter_project" and text:
         payload["project_code"] = text.upper()[:50]
         save_expense(user_id, payload)
