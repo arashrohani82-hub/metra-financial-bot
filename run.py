@@ -10,6 +10,7 @@ import openpyxl
 from pypdf import PdfReader
 
 import app as core
+from receipt_ai import _choose_model
 
 CHEQUING_DIR = core.DATA_DIR / "chequing_statements"
 CHEQUING_DIR.mkdir(parents=True, exist_ok=True)
@@ -112,7 +113,7 @@ Rules:
 STATEMENT TEXT:
 """ + text
     response = core.Anthropic(api_key=core.ANTHROPIC_API_KEY).messages.create(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=_choose_model(core.ANTHROPIC_API_KEY),
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -138,7 +139,7 @@ Use only printed transaction amounts. Do not estimate.
 STATEMENT TEXT:
 """ + text
     response = core.Anthropic(api_key=core.ANTHROPIC_API_KEY).messages.create(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=_choose_model(core.ANTHROPIC_API_KEY),
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
