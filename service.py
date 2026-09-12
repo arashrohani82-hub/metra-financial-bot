@@ -54,7 +54,7 @@ def _extract_receipt_with_retry(image_bytes):
 
 @app.get("/status")
 def router_status():
-    return jsonify({"status": "ok", "service": "metra-bookkeeping"})
+    return jsonify({"status": "ok", "service": "metra-bookkeeping", "receivables": "active"})
 
 
 @app.post("/router/receipt")
