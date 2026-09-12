@@ -247,6 +247,49 @@ def router_company_metrics():
                 FROM company_receipt_statements WHERE status='finalized'
                 """
             ).fetchone()
+            received_months = connection.execute(
+                """
+                SELECT substr(statement_date,1,7) AS month, COALESCE(SUM(confirmed_revenue),0) AS total
+                FROM company_receipt_statements
+                WHERE status='finalized' AND substr(statement_date,1,4)=?
+                GROUP BY substr(statement_date,1,7)
+                """,
+                (year,),
+            ).fetchall()
+            receipt_expense_months = connection.execute(
+                """
+                SELECT substr(expense_date,1,7) AS month, COALESCE(SUM(total),0) AS total
+                FROM expenses
+                WHERE expense_type='company' AND substr(expense_date,1,4)=?
+                GROUP BY substr(expense_date,1,7)
+                """,
+                (year,),
+            ).fetchall()
+            bank_expense_months = connection.execute(
+                """
+                SELECT substr(s.statement_date,1,7) AS month, COALESCE(SUM(o.amount),0) AS total
+                FROM company_bank_outflows o
+                JOIN company_outflow_analyses a ON a.id=o.analysis_id
+                JOIN company_receipt_statements s ON s.id=a.statement_id
+                WHERE o.classification='company_expense' AND a.status='finalized'
+                  AND substr(s.statement_date,1,4)=?
+                GROUP BY substr(s.statement_date,1,7)
+                """,
+                (year,),
+            ).fetchall()
+
+        received_map = {row["month"]: float(row["total"] or 0) for row in received_months}
+        expense_map = {}
+        for row in list(receipt_expense_months) + list(bank_expense_months):
+            expense_map[row["month"]] = expense_map.get(row["month"], 0.0) + float(row["total"] or 0)
+        cashflow_monthly = [
+            {
+                "month": f"{year}-{month:02d}",
+                "received": round(received_map.get(f"{year}-{month:02d}", 0.0), 2),
+                "expenses": round(expense_map.get(f"{year}-{month:02d}", 0.0), 2),
+            }
+            for month in range(1, 13)
+        ]
 
         receipt_ytd_total = float(receipt_ytd["total"] or 0)
         bank_ytd_total = float(bank_ytd["total"] or 0)
@@ -268,6 +311,7 @@ def router_company_metrics():
             "received_ytd": round(float(received_ytd["total"] or 0), 2),
             "received_statement_count_all_time": int(received_all_time["statements"] or 0),
             "received_all_time": round(float(received_all_time["total"] or 0), 2),
+            "cashflow_monthly": cashflow_monthly,
         })
     except Exception as exc:
         logger.exception("CEO bookkeeping metrics failed")
