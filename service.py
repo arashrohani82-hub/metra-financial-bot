@@ -186,13 +186,13 @@ def router_project():
 
 @app.get("/router/company-metrics")
 def router_company_metrics():
-    """Private company-expense totals for the CEO dashboard."""
+    """Private, reconciled company cash metrics for the CEO dashboard."""
     if not _authorized_router_request():
         return _forbidden()
     year = time.strftime("%Y")
     try:
         with accounting.db() as connection:
-            ytd = connection.execute(
+            receipt_ytd = connection.execute(
                 """
                 SELECT COUNT(*) AS transactions, COALESCE(SUM(total), 0) AS total
                 FROM expenses
@@ -200,12 +200,38 @@ def router_company_metrics():
                 """,
                 (year,),
             ).fetchone()
-            all_time = connection.execute(
+            receipt_all = connection.execute(
                 """
                 SELECT COUNT(*) AS transactions, COALESCE(SUM(total), 0) AS total
-                FROM expenses
-                WHERE expense_type='company'
+                FROM expenses WHERE expense_type='company'
                 """
+            ).fetchone()
+            bank_ytd = connection.execute(
+                """
+                SELECT COUNT(o.id) AS transactions, COALESCE(SUM(o.amount), 0) AS total
+                FROM company_bank_outflows o
+                JOIN company_outflow_analyses a ON a.id=o.analysis_id
+                JOIN company_receipt_statements s ON s.id=a.statement_id
+                WHERE o.classification='company_expense' AND a.status='finalized'
+                  AND substr(s.statement_date, 1, 4)=?
+                """,
+                (year,),
+            ).fetchone()
+            bank_all = connection.execute(
+                """
+                SELECT COUNT(o.id) AS transactions, COALESCE(SUM(o.amount), 0) AS total
+                FROM company_bank_outflows o
+                JOIN company_outflow_analyses a ON a.id=o.analysis_id
+                WHERE o.classification='company_expense' AND a.status='finalized'
+                """
+            ).fetchone()
+            bank_statement_ytd = connection.execute(
+                """
+                SELECT COUNT(*) AS statements FROM company_outflow_analyses a
+                JOIN company_receipt_statements s ON s.id=a.statement_id
+                WHERE a.status='finalized' AND substr(s.statement_date, 1, 4)=?
+                """,
+                (year,),
             ).fetchone()
             received_ytd = connection.execute(
                 """
@@ -218,17 +244,26 @@ def router_company_metrics():
             received_all_time = connection.execute(
                 """
                 SELECT COUNT(*) AS statements, COALESCE(SUM(confirmed_revenue), 0) AS total
-                FROM company_receipt_statements
-                WHERE status='finalized'
+                FROM company_receipt_statements WHERE status='finalized'
                 """
             ).fetchone()
+
+        receipt_ytd_total = float(receipt_ytd["total"] or 0)
+        bank_ytd_total = float(bank_ytd["total"] or 0)
+        receipt_all_total = float(receipt_all["total"] or 0)
+        bank_all_total = float(bank_all["total"] or 0)
         return jsonify({
             "ok": True,
             "year": int(year),
-            "company_expense_transactions_ytd": int(ytd["transactions"] or 0),
-            "company_expenses_ytd": round(float(ytd["total"] or 0), 2),
-            "company_expense_transactions_all_time": int(all_time["transactions"] or 0),
-            "company_expenses_all_time": round(float(all_time["total"] or 0), 2),
+            "receipt_expense_transactions_ytd": int(receipt_ytd["transactions"] or 0),
+            "receipt_expenses_ytd": round(receipt_ytd_total, 2),
+            "bank_expense_transactions_ytd": int(bank_ytd["transactions"] or 0),
+            "bank_new_expenses_ytd": round(bank_ytd_total, 2),
+            "bank_expense_statements_ytd": int(bank_statement_ytd["statements"] or 0),
+            "company_expense_transactions_ytd": int(receipt_ytd["transactions"] or 0) + int(bank_ytd["transactions"] or 0),
+            "company_expenses_ytd": round(receipt_ytd_total + bank_ytd_total, 2),
+            "company_expense_transactions_all_time": int(receipt_all["transactions"] or 0) + int(bank_all["transactions"] or 0),
+            "company_expenses_all_time": round(receipt_all_total + bank_all_total, 2),
             "received_statement_count_ytd": int(received_ytd["statements"] or 0),
             "received_ytd": round(float(received_ytd["total"] or 0), 2),
             "received_statement_count_all_time": int(received_all_time["statements"] or 0),
