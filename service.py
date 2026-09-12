@@ -7,7 +7,7 @@ import time
 
 from flask import jsonify, request
 
-import named_run as named_accounting
+import receivables_runtime as named_accounting
 from receipt_ai import extract_receipt_resilient
 
 # Railway starts this module directly.  Import the complete named runtime here,
@@ -207,6 +207,21 @@ def router_company_metrics():
                 WHERE expense_type='company'
                 """
             ).fetchone()
+            received_ytd = connection.execute(
+                """
+                SELECT COUNT(*) AS statements, COALESCE(SUM(confirmed_revenue), 0) AS total
+                FROM company_receipt_statements
+                WHERE status='finalized' AND substr(statement_date, 1, 4)=?
+                """,
+                (year,),
+            ).fetchone()
+            received_all_time = connection.execute(
+                """
+                SELECT COUNT(*) AS statements, COALESCE(SUM(confirmed_revenue), 0) AS total
+                FROM company_receipt_statements
+                WHERE status='finalized'
+                """
+            ).fetchone()
         return jsonify({
             "ok": True,
             "year": int(year),
@@ -214,6 +229,10 @@ def router_company_metrics():
             "company_expenses_ytd": round(float(ytd["total"] or 0), 2),
             "company_expense_transactions_all_time": int(all_time["transactions"] or 0),
             "company_expenses_all_time": round(float(all_time["total"] or 0), 2),
+            "received_statement_count_ytd": int(received_ytd["statements"] or 0),
+            "received_ytd": round(float(received_ytd["total"] or 0), 2),
+            "received_statement_count_all_time": int(received_all_time["statements"] or 0),
+            "received_all_time": round(float(received_all_time["total"] or 0), 2),
         })
     except Exception as exc:
         logger.exception("CEO bookkeeping metrics failed")
