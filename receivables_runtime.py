@@ -301,7 +301,7 @@ def _finalize_statement(chat_id, user_id, statement_id):
         )
 
 
-def handle_company_statement(message):
+def handle_company_statement(message, pdf_bytes=None):
     user_id = message["from"]["id"]
     chat_id = message["chat"]["id"]
     document = message.get("document") or {}
@@ -309,7 +309,8 @@ def handle_company_statement(message):
         core.send_message(chat_id, "فایل گزارش بانکی باید PDF باشد.", reply_markup=main_menu())
         return
     core.send_message(chat_id, "🔎 گزارش بانکی در حال استخراج و تطبیق است…")
-    pdf_bytes = core.download_telegram_file(document["file_id"])
+    if pdf_bytes is None:
+        pdf_bytes = core.download_telegram_file(document["file_id"])
     digest = hashlib.sha256(pdf_bytes).hexdigest()
     with core.db() as connection:
         duplicate = connection.execute(
@@ -422,9 +423,28 @@ def handle_message(message):
     if text in {"/receipts_report", "📥 گزارش دریافتی"}:
         core.send_message(chat_id, receivables_dashboard(user_id), reply_markup=main_menu())
         return
-    if message.get("document") and step == "await_company_statement":
-        handle_company_statement(message)
-        return
+    if message.get("document"):
+        document = message["document"]
+        is_pdf = (
+            document.get("file_name", "").lower().endswith(".pdf")
+            or document.get("mime_type") == "application/pdf"
+        )
+        if step == "await_company_statement":
+            handle_company_statement(message)
+            return
+        if is_pdf:
+            pdf_bytes = core.download_telegram_file(document["file_id"])
+            try:
+                preview = _pdf_text(pdf_bytes)[:5000].lower()
+            except Exception:
+                preview = ""
+            business_markers = (
+                "business account", "business banking", "business deposit account",
+                "compte d'entreprise", "compte entreprise",
+            )
+            if any(marker in preview for marker in business_markers):
+                handle_company_statement(message, pdf_bytes=pdf_bytes)
+                return
     if step == "review_company_deposits" and not message.get("document"):
         core.send_message(chat_id, "لطفاً نوع واریزی نمایش‌داده‌شده را از دکمه‌ها انتخاب کن.")
         return
