@@ -8,6 +8,7 @@ from datetime import datetime
 from pypdf import PdfReader
 
 import named_run as named_accounting
+from receipt_ai import _choose_model
 
 
 core = named_accounting.core
@@ -141,8 +142,9 @@ STRICT RULES:
 
 BANK STATEMENT TEXT:
 """ + text[:140000]
+    model = _choose_model(core.ANTHROPIC_API_KEY)
     response = core.Anthropic(api_key=core.ANTHROPIC_API_KEY).messages.create(
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=model,
         max_tokens=5000,
         messages=[{"role": "user", "content": prompt}],
     )
