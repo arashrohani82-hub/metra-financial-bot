@@ -182,3 +182,39 @@ def router_project():
     accounting.save_expense(user_id, payload)
     accounting.set_session(user_id)
     return jsonify({"ok": True, "state": "saved", "project_code": project_code})
+
+
+@app.get("/router/company-metrics")
+def router_company_metrics():
+    """Private company-expense totals for the CEO dashboard."""
+    if not _authorized_router_request():
+        return _forbidden()
+    year = time.strftime("%Y")
+    try:
+        with accounting.db() as connection:
+            ytd = connection.execute(
+                """
+                SELECT COUNT(*) AS transactions, COALESCE(SUM(total), 0) AS total
+                FROM expenses
+                WHERE expense_type='company' AND substr(expense_date, 1, 4)=?
+                """,
+                (year,),
+            ).fetchone()
+            all_time = connection.execute(
+                """
+                SELECT COUNT(*) AS transactions, COALESCE(SUM(total), 0) AS total
+                FROM expenses
+                WHERE expense_type='company'
+                """
+            ).fetchone()
+        return jsonify({
+            "ok": True,
+            "year": int(year),
+            "company_expense_transactions_ytd": int(ytd["transactions"] or 0),
+            "company_expenses_ytd": round(float(ytd["total"] or 0), 2),
+            "company_expense_transactions_all_time": int(all_time["transactions"] or 0),
+            "company_expenses_all_time": round(float(all_time["total"] or 0), 2),
+        })
+    except Exception as exc:
+        logger.exception("CEO bookkeeping metrics failed")
+        return jsonify({"ok": False, "error": "metrics_unavailable", "detail": str(exc)[:180]}), 503
