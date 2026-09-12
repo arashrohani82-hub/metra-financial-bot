@@ -70,6 +70,13 @@ with core.db() as connection:
         ON company_deposits(statement_id, classification, id);
         """
     )
+    statement_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(company_receipt_statements)")
+    }
+    if "original_filename" not in statement_columns:
+        connection.execute(
+            "ALTER TABLE company_receipt_statements ADD COLUMN original_filename TEXT"
+        )
 
 
 def _menu():
@@ -233,9 +240,13 @@ def _review_next(chat_id, user_id, statement_id):
         "other_non_revenue": "سایر غیر درآمد", "unknown": "نامشخص",
     }
     suggestion = suggestion_labels.get(deposit["suggested_classification"], "نامشخص")
+    statement_label = statement["original_filename"] or f"گزارش #{statement_id}"
+    statement_period = statement["period_end"] or statement["statement_date"]
     core.send_message(
         chat_id,
-        f"🔎 <b>بررسی واریزی {reviewed + 1} از {total}</b>\n\n"
+        f"🔎 <b>بررسی واریزی {reviewed + 1} از {total}</b>\n"
+        f"📄 فایل: <b>{core.safe(statement_label)}</b>\n"
+        f"🗓 دوره گزارش: <b>{core.safe(statement_period)}</b>\n\n"
         f"📅 تاریخ: <b>{core.safe(deposit['txn_date'] or 'ثبت نشده')}</b>\n"
         f"📝 شرح بانک: <b>{core.safe(deposit['description'])}</b>\n"
         f"💵 مبلغ: <b>{_money(deposit['amount'])}</b>\n\n"
@@ -277,7 +288,6 @@ def _finalize_statement(chat_id, user_id, statement_id):
             (totals["revenue"], totals["excluded"], totals["pending"], difference, status, now, statement_id),
         )
     if status == "finalized":
-        core.set_session(user_id)
         core.send_message(
             chat_id,
             "✅ <b>دریافتی این گزارش قطعی شد</b>\n\n"
@@ -289,7 +299,6 @@ def _finalize_statement(chat_id, user_id, statement_id):
             reply_markup=main_menu(),
         )
     else:
-        core.set_session(user_id)
         core.send_message(
             chat_id,
             "⚠️ <b>گزارش نیاز به تطبیق دارد</b>\n\n"
@@ -349,6 +358,10 @@ def handle_company_statement(message, pdf_bytes=None):
             ),
         )
         statement_id = cursor.lastrowid
+        connection.execute(
+            "UPDATE company_receipt_statements SET original_filename=? WHERE id=?",
+            (document.get("file_name", "")[:300], statement_id),
+        )
         connection.executemany(
             """
             INSERT INTO company_deposits(
@@ -364,7 +377,7 @@ def handle_company_statement(message, pdf_bytes=None):
                 for item in data["deposits"]
             ],
         )
-    core.set_session(user_id, "review_company_deposits", {"statement_id": statement_id})
+    core.set_session(user_id)
     core.send_message(
         chat_id,
         f"📄 <b>{len(data['deposits'])} واریزی استخراج شد</b>\n"
@@ -390,13 +403,74 @@ def receivables_dashboard(user_id):
             "SELECT COUNT(*) AS n FROM company_receipt_statements WHERE user_id=? AND status!='finalized'",
             (user_id,),
         ).fetchone()["n"]
+        statements = connection.execute(
+            """
+            SELECT s.*,
+              SUM(CASE WHEN d.classification='pending' THEN 1 ELSE 0 END) AS pending_count
+            FROM company_receipt_statements s
+            LEFT JOIN company_deposits d ON d.statement_id=s.id
+            WHERE s.user_id=?
+            GROUP BY s.id
+            ORDER BY COALESCE(s.period_end, s.statement_date) DESC, s.id DESC
+            LIMIT 18
+            """,
+            (user_id,),
+        ).fetchall()
+    lines = []
+    status_labels = {
+        "finalized": "✅ نهایی",
+        "review": "⏳ در انتظار بررسی",
+        "reconciliation_required": "⚠️ نیازمند تطبیق",
+    }
+    for statement in statements:
+        period = statement["period_end"] or statement["statement_date"]
+        filename = statement["original_filename"] or f"گزارش #{statement['id']}"
+        status = status_labels.get(statement["status"], statement["status"])
+        if statement["status"] == "finalized":
+            detail = f"دریافتی {_money(statement['confirmed_revenue'])}"
+        elif statement["status"] == "review":
+            detail = f"{int(statement['pending_count'] or 0)} واریزی بررسی‌نشده"
+        else:
+            detail = f"اختلاف {_money(abs(statement['reconciliation_difference']))}"
+        lines.append(
+            f"• <b>{core.safe(period)}</b> — {status}\n"
+            f"  {core.safe(filename)}\n"
+            f"  {detail}"
+        )
+    statement_list = "\n\n".join(lines) if lines else "هنوز گزارشی ثبت نشده است."
     return (
         f"📥 <b>گزارش دریافتی شرکت — {year}</b>\n\n"
         f"💰 دریافتی قطعی: <b>{_money(ytd['received'])}</b>\n"
         f"📄 گزارش‌های نهایی‌شده: <b>{int(ytd['months'] or 0)}</b>\n"
         f"⏳ گزارش‌های نیازمند بررسی/تطبیق: <b>{int(pending or 0)}</b>\n\n"
-        "فقط واریزی‌های تأییدشده مشتریان در عدد بالا محاسبه شده‌اند."
+        "فقط واریزی‌های تأییدشده مشتریان در عدد بالا محاسبه شده‌اند.\n\n"
+        f"<b>وضعیت فایل‌ها:</b>\n{statement_list}"
     )
+
+
+def receivables_dashboard_keyboard(user_id):
+    with core.db() as connection:
+        statements = connection.execute(
+            """
+            SELECT s.id, COALESCE(s.period_end, s.statement_date) AS period,
+                   SUM(CASE WHEN d.classification='pending' THEN 1 ELSE 0 END) AS pending_count
+            FROM company_receipt_statements s
+            JOIN company_deposits d ON d.statement_id=s.id
+            WHERE s.user_id=? AND s.status='review'
+            GROUP BY s.id
+            HAVING pending_count > 0
+            ORDER BY period DESC, s.id DESC
+            LIMIT 12
+            """,
+            (user_id,),
+        ).fetchall()
+    return [
+        [{
+            "text": f"▶️ ادامه {row['period']} ({int(row['pending_count'])} مورد)",
+            "callback_data": f"recvstmt:{row['id']}",
+        }]
+        for row in statements
+    ]
 
 
 _previous_handle_message = core.handle_message
@@ -421,7 +495,14 @@ def handle_message(message):
         )
         return
     if text in {"/receipts_report", "📥 گزارش دریافتی"}:
-        core.send_message(chat_id, receivables_dashboard(user_id), reply_markup=main_menu())
+        core.set_session(user_id)
+        review_buttons = receivables_dashboard_keyboard(user_id)
+        core.send_message(
+            chat_id,
+            receivables_dashboard(user_id),
+            review_buttons if review_buttons else None,
+        )
+        core.send_message(chat_id, "از منوی زیر ادامه بده:", reply_markup=main_menu())
         return
     if message.get("document"):
         document = message["document"]
@@ -453,7 +534,7 @@ def handle_message(message):
 
 def handle_callback(callback):
     action = callback.get("data", "")
-    if not action.startswith("recv:"):
+    if not (action.startswith("recv:") or action.startswith("recvstmt:")):
         _previous_handle_callback(callback)
         return
     core.answer_callback(callback["id"])
@@ -462,6 +543,22 @@ def handle_callback(callback):
     if not core.is_allowed(user_id):
         core.send_message(chat_id, "⛔️ دسترسی مجاز نیست.")
         return
+    if action.startswith("recvstmt:"):
+        try:
+            statement_id = int(action.split(":", 1)[1])
+        except ValueError:
+            core.send_message(chat_id, "گزارش نامعتبر بود.")
+            return
+        with core.db() as connection:
+            owned = connection.execute(
+                "SELECT id FROM company_receipt_statements WHERE id=? AND user_id=?",
+                (statement_id, user_id),
+            ).fetchone()
+        if not owned:
+            core.send_message(chat_id, "این گزارش پیدا نشد.")
+            return
+        _review_next(chat_id, user_id, statement_id)
+        return
     try:
         _, raw_id, key = action.split(":", 2)
         deposit_id = int(raw_id)
@@ -469,24 +566,20 @@ def handle_callback(callback):
     except (ValueError, KeyError):
         core.send_message(chat_id, "انتخاب نامعتبر بود.")
         return
-    step, payload = core.get_session(user_id)
-    statement_id = int(payload.get("statement_id") or 0)
-    if step != "review_company_deposits" or not statement_id:
-        core.send_message(chat_id, "جلسه بررسی پایان یافته؛ گزارش دریافتی را دوباره باز کن.")
-        return
     now = datetime.utcnow().isoformat()
     with core.db() as connection:
         deposit = connection.execute(
             """
-            SELECT d.id FROM company_deposits d
+            SELECT d.id, d.statement_id FROM company_deposits d
             JOIN company_receipt_statements s ON s.id=d.statement_id
-            WHERE d.id=? AND d.statement_id=? AND s.user_id=? AND d.classification='pending'
+            WHERE d.id=? AND s.user_id=? AND d.classification='pending'
             """,
-            (deposit_id, statement_id, user_id),
+            (deposit_id, user_id),
         ).fetchone()
         if not deposit:
             core.send_message(chat_id, "این واریزی قبلاً بررسی شده یا متعلق به این گزارش نیست.")
             return
+        statement_id = int(deposit["statement_id"])
         connection.execute(
             "UPDATE company_deposits SET classification=?, reviewed_by=?, reviewed_at=? WHERE id=?",
             (classification, user_id, now, deposit_id),
